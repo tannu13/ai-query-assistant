@@ -27,7 +27,7 @@ export const config = [
      * ESLint's default file set is js/mjs/cjs only. Without naming TypeScript
      * here, a TS-only package lints "clean" because its source is never read.
      */
-    files: ["**/*.{js,mjs,cjs,ts,tsx}"],
+    files: ["**/*.{js,mjs,cjs,ts,tsx,jsx}"],
     languageOptions: {
       parser: babelParser,
       parserOptions: {
@@ -42,6 +42,30 @@ export const config = [
     },
     rules: {
       "turbo/no-undeclared-env-vars": "warn",
+    },
+  },
+  {
+    /**
+     * JSX needs its own parser options. Without this block every `.tsx` file
+     * fails with "Parsing error: Unexpected token" — reported as a lint error
+     * but really the linter being unable to read the file at all, which means
+     * the whole app would lint "clean" by never being looked at.
+     *
+     * `@babel/plugin-syntax-jsx` rather than `@babel/preset-react`: a linter
+     * only needs to PARSE JSX, never to transform it, and the syntax plugin
+     * is the smallest thing that does that. (The `isTSX`/`allExtensions`
+     * options that used to serve this purpose were removed in Babel 8.)
+     */
+    files: ["**/*.{tsx,jsx}"],
+    languageOptions: {
+      parser: babelParser,
+      parserOptions: {
+        requireConfigFile: false,
+        babelOptions: {
+          presets: [require.resolve("@babel/preset-typescript")],
+          plugins: [require.resolve("@babel/plugin-syntax-jsx")],
+        },
+      },
     },
   },
   {

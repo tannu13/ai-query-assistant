@@ -241,6 +241,92 @@ describe('the Gemini adapter end to end, through its generate seam', () => {
     expect(error.context).toEqual({ timeoutMs: 50 });
   });
 
+  it('enforces its deadline even when the provider ignores the abort signal', async () => {
+    /**
+     * The regression test for a bug found by live traffic, which the earlier
+     * hanging-provider test could not catch because that provider aborted
+     * politely.
+     *
+     * Observed against the real API: one call took 37,598ms against
+     * LLM_TIMEOUT_MS=20000 and returned LLM_UNAVAILABLE rather than
+     * LLM_TIMEOUT. The SDK does honour `abortSignal` in isolation, but when a
+     * retryable failure lands just before the deadline the abort does not
+     * reach the next attempt's in-flight fetch — so the guarantee was
+     * timing-dependent, which is the same as not having one.
+     *
+     * This provider ignores its signal completely, which is the worst case
+     * and makes the assertion deterministic: `complete()` must still reject
+     * with LLM_TIMEOUT at roughly the deadline, because the deadline is now
+     * enforced by the adapter rather than delegated to the SDK.
+     */
+    const ignoresAbort = createGeminiProvider({
+      apiKey: 'test-only-never-used',
+      model: 'gemini-flash-latest',
+      timeoutMs: 120,
+      // No signal handling at all, and it outlives the deadline many times.
+      generate: () => new Promise((resolve) => setTimeout(resolve, 5_000)),
+    });
+
+    const startedAt = performance.now();
+    const error = (await ignoresAbort
+      .complete({ prompt: 'hello' })
+      .catch((e: unknown) => e)) as AppError;
+    const elapsedMs = performance.now() - startedAt;
+
+    expect(error).toBeInstanceOf(AppError);
+    expect(error.code).toBe('LLM_TIMEOUT');
+    expect(error.status).toBe(504);
+    // The point of the test: bounded by the deadline, not by the provider.
+    expect(elapsedMs).toBeLessThan(1_000);
+  });
+
+  it('does not surface a late provider rejection as an unhandled rejection', async () => {
+    // Once the deadline has won the race, the original call may still reject.
+    // Unhandled, that would take the process down under Bun — so the adapter
+    // must keep a handler attached to the promise it abandoned.
+    const lateReject = createGeminiProvider({
+      apiKey: 'test-only-never-used',
+      model: 'gemini-flash-latest',
+      timeoutMs: 60,
+      generate: () =>
+        new Promise((_resolve, reject) =>
+          setTimeout(() => reject(new Error('too late')), 200),
+        ),
+    });
+
+    const error = (await lateReject
+      .complete({ prompt: 'hello' })
+      .catch((e: unknown) => e)) as AppError;
+    expect(error.code).toBe('LLM_TIMEOUT');
+
+    // Give the abandoned promise time to reject while nothing is awaiting it.
+    await Bun.sleep(300);
+  });
+
+  it('still allows a slow-but-successful call inside the deadline', async () => {
+    // Guard against the tempting "fix" of slicing the per-attempt timeout
+    // into timeoutMs/attempts, which would fail a call that legitimately
+    // takes longer than one slice but less than the whole budget.
+    const slow = createGeminiProvider({
+      apiKey: 'test-only-never-used',
+      model: 'gemini-flash-latest',
+      timeoutMs: 400,
+      generate: () =>
+        new Promise((resolve) =>
+          setTimeout(
+            () =>
+              resolve(
+                buildResponse({ text: 'worth waiting for', finishReason: FinishReason.STOP }),
+              ),
+            250,
+          ),
+        ),
+    });
+
+    const completion = await slow.complete({ prompt: 'hello' });
+    expect(completion.text).toBe('worth waiting for');
+  });
+
   it('maps an upstream 429 to LLM_RATE_LIMITED with a Retry-After hint', async () => {
     const limited = provider(() =>
       Promise.reject(new ApiError({ message: 'quota exceeded', status: 429 })),

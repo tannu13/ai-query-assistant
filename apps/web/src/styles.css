@@ -1,0 +1,313 @@
+/*
+ * Plain CSS, deliberately. The brief asks for a "clean UI", not a design
+ * system, and a dependency-free stylesheet keeps the reviewable surface on
+ * the parts that are actually being assessed.
+ *
+ * What is NOT skipped: visible focus rings, labelled controls, adequate
+ * contrast in both colour schemes, and a layout that survives a narrow
+ * viewport. Those are correctness, not polish.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --border: #d8dce3;
+  --text: #15181d;
+  --muted: #5b6472;
+  --accent: #2f5bd7;
+  --accent-text: #ffffff;
+  --danger: #a8231b;
+  --danger-bg: #fdf0ef;
+  --danger-border: #f0c4c0;
+  --warning: #7a4e00;
+  --warning-bg: #fff8e8;
+  --warning-border: #f0dcb0;
+  --code-bg: #eceff4;
+
+  --radius: 10px;
+  --gap: 1rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15181d;
+    --surface: #1d2127;
+    --border: #333a45;
+    --text: #e8ebef;
+    --muted: #9aa5b4;
+    --accent: #7ba1ff;
+    --accent-text: #0e1116;
+    --danger: #ff9d95;
+    --danger-bg: #2a1a19;
+    --danger-border: #5a2f2b;
+    --warning: #f0c879;
+    --warning-bg: #2a2317;
+    --warning-border: #5a4a2b;
+    --code-bg: #262c34;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.6 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+
+.page {
+  max-width: 48rem;
+  /* A side gutter rather than 0, so text never touches the edge on a phone. */
+  margin: 0 auto;
+  padding: 2rem 1rem 3rem;
+}
+
+.page__header h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.6rem;
+  letter-spacing: -0.01em;
+}
+
+.page__footer {
+  margin-top: 2rem;
+  font-size: 0.85rem;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.session {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 1rem;
+  font-size: 0.9rem;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+  margin-top: var(--gap);
+}
+
+.card h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.1rem;
+}
+
+.card__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.card__header h2 {
+  margin-bottom: 0;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin: 1rem 0;
+}
+
+label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+input,
+textarea {
+  width: 100%;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  /* Prompts are prose; a monospace textarea reads worse and wraps worse. */
+  resize: vertical;
+}
+
+input:disabled,
+textarea:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/*
+ * One visible focus style for every interactive element. `:focus-visible`
+ * rather than `:focus` so a mouse click does not leave a ring behind, while
+ * keyboard navigation always shows one. Never `outline: none`.
+ */
+:where(input, textarea, button, a):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.button {
+  padding: 0.55rem 1.1rem;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: var(--accent);
+  color: var(--accent-text);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.button--ghost {
+  background: transparent;
+  color: var(--text);
+  border-color: var(--border);
+  font-weight: 500;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.hint {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+kbd {
+  padding: 0.05rem 0.3rem;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--code-bg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+}
+
+.counter {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.counter--over {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--gap);
+  margin-top: var(--gap);
+  padding: 0.9rem 1rem;
+  border: 1px solid;
+  border-radius: var(--radius);
+}
+
+.notice--error {
+  background: var(--danger-bg);
+  border-color: var(--danger-border);
+  color: var(--danger);
+}
+
+.notice--warning {
+  background: var(--warning-bg);
+  border-color: var(--warning-border);
+  color: var(--warning);
+  display: block;
+}
+
+.notice__body {
+  flex: 1 1 18rem;
+}
+
+.notice p {
+  margin: 0 0 0.35rem;
+}
+
+.notice__message {
+  font-weight: 600;
+}
+
+.notice__guidance,
+.notice__meta {
+  color: inherit;
+  opacity: 0.85;
+  font-size: 0.85rem;
+}
+
+.notice__details {
+  margin: 0.35rem 0;
+  padding-left: 1.2rem;
+  font-size: 0.85rem;
+}
+
+.badge {
+  padding: 0.15rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--code-bg);
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/*
+ * `pre-wrap` keeps the model's paragraph breaks without interpreting
+ * anything, and `overflow-wrap` stops a long unbroken token (a URL, a hash)
+ * from forcing horizontal scroll on the whole page.
+ */
+.answer {
+  margin: 0.75rem 0 1rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 1.5rem;
+  margin: 0;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.8rem;
+}
+
+.meta dt {
+  color: var(--muted);
+}
+
+.meta dd {
+  margin: 0;
+}
+
+code {
+  padding: 0.1rem 0.3rem;
+  border-radius: 4px;
+  background: var(--code-bg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
+  overflow-wrap: anywhere;
+}

@@ -1,7 +1,7 @@
 # AI Query Assistant — Implementation Plan
 
 **Assignment:** Husqvarna Group / GIS India — Take-Home Engineering Exercise, Senior Full Stack Engineer (Cloud & AI Applications)
-**Status:** Phases 0–5 complete on branch `feat/ai-query-assistant` (Phase 4 gate 1 awaits a real `GEMINI_API_KEY` — see its outcome). **The backend is feature-complete.** Phase 6 next.
+**Status:** Phases 0–6 complete on branch `feat/ai-query-assistant` (Phase 4 gate 1 awaits a real `GEMINI_API_KEY` — see its outcome). **Backend and frontend both feature-complete.** Phase 7 next.
 **Budget:** ~3–4 hours, per the brief.
 
 ---
@@ -715,12 +715,12 @@ Gates 2, 3 and 4 pass. **Gate 1 (a real round-trip returning model output) is un
 
 Read out of `@google/genai@2.31.0`'s type definitions and shipped JavaScript, not its README.
 
-**1. `httpOptions` timeout and abort-signal support — both exist, and they compose.** `HttpOptions.timeout` is milliseconds, and `GenerateContentConfig.abortSignal` is a real `AbortSignal`. The plan's fallback (an `AbortSignal.timeout()` wrapper at the adapter boundary) is not needed — but reading `createAttemptSignal` in the shipped code showed the two mean *different* things:
+**1. `httpOptions` timeout and abort-signal support — both exist, but ⚠️ they do NOT compose into a reliable total deadline.** `HttpOptions.timeout` is milliseconds, and `GenerateContentConfig.abortSignal` is a real `AbortSignal`. Reading `createAttemptSignal` in the shipped code showed the two mean *different* things:
 
 - `httpOptions.timeout` bounds **each attempt**; the SDK builds a fresh signal per attempt from it.
-- `abortSignal` is the **same object across every attempt**, so it bounds the whole sequence, backoff included. `onFailedAttempt` also re-throws immediately if it has aborted.
+- `abortSignal` is the **same object across every attempt**, so it *appears* to bound the whole sequence, backoff included. `onFailedAttempt` also re-throws immediately if it has aborted.
 
-The adapter therefore sets both: `timeout` per attempt, and an `AbortSignal.timeout(LLM_TIMEOUT_MS)` composed with the caller's signal via `AbortSignal.any()` as the hard ceiling. Without the second, `attempts × timeout + backoff` would be the real worst case and the configured deadline would be fiction.
+**That second conclusion was wrong, and live traffic disproved it.** See "Finding — the total deadline was not actually enforced" below. The adapter no longer relies on it: the deadline is enforced by racing the call against it in `complete()`. The plan's original fallback instinct — an `AbortSignal.timeout()` wrapper at the adapter boundary — turned out to be the right one after all, just for a different reason than anticipated.
 
 **2. `FinishReason` and `BlockedReason` enum members — the plan guessed the type name wrong.** It is `BlockedReason`, not `BlockReason`. `FinishReason` has **19** members and `BlockedReason` has **8**:
 
@@ -759,17 +759,56 @@ Opted in, but not with those defaults, which are lifted from a Cloud Storage ret
 
 **The smoke script exits non-zero**, distinguishing 1 (a typed `AppError`, i.e. the adapter did its job) from 2 (an unmapped throw, i.e. it did not). That makes it usable as a deployment smoke check rather than something read by eye.
 
-### ⬜ Remaining step for gate 1
+### 🔧 Post-Phase-6 corrections, found by running against the real API
 
-Put a real Google AI Studio key in `apps/backend/.env` (`GEMINI_API_KEY=…`, from https://aistudio.google.com/apikey), then:
+Both of these were invisible to the fake provider and to the whole test suite. They appeared within minutes of the first real `GEMINI_API_KEY` being configured, which is the argument for Phase 4's gate 1 existing at all.
 
-```sh
-cd apps/backend && bun run scripts/smoke-llm.ts "Why is the sky blue?"
-# expect: exit 0, real answer text, a resolved model id more specific than
-# `gemini-flash-latest`, finishReason STOP, and a usage block.
+**Finding — the total deadline was not actually enforced.** §17 item 1 concluded that a shared `abortSignal` bounds the whole retry sequence. Measured against the live API, one call took **37,598 ms against `LLM_TIMEOUT_MS=20000`** and returned `LLM_UNAVAILABLE` rather than `LLM_TIMEOUT`.
+
+Diagnosed by instrumenting the SDK's `httpOptions.fetch` hook rather than by reading minified source:
+
+```
+     3ms  attempt 1 START   deadlineAborted=false
+ 19211ms  attempt 1 END     status=504
+ 20000ms  DEADLINE fired
+ 20003ms  attempt 2 START   signalAborted=true
+ 20003ms  attempt 2 THREW   AbortError        <- correct, bounded at 20s
 ```
 
-Nothing else depends on it: the adapter, its tests, and Phases 5–6 are verified through the injected `generate` seam and `LLM_PROVIDER=fake`.
+That run behaved correctly. The failing shape is the other one: when attempt 1 fails slightly *earlier*, attempt 2's fetch is already in flight when the deadline fires, and the abort does not reach it — so the call runs to roughly `attempts × timeout`. The SDK honours `abortSignal` in isolation (verified independently: a 2 s signal aborts a request at 2001 ms), so this is a race, not a missing feature. **A guarantee that holds only when the timing is favourable is not a guarantee.**
+
+Fixed by enforcing the deadline in `complete()`: the `generate()` call is raced against a promise that rejects on the deadline signal, so the adapter cannot exceed `LLM_TIMEOUT_MS` whatever the SDK or the runtime does. Two details worth recording:
+
+- **The abandoned promise keeps a handler attached** (`call.catch(() => undefined)`). Without it, a provider rejecting *after* the deadline has won produces an unhandled rejection, which under Bun takes the process down — converting a handled timeout into a crash.
+- **The per-attempt timeout is deliberately NOT sliced** into `timeoutMs / attempts`. Slicing bounds each attempt tidily but fails a call that legitimately takes longer than one slice while still finishing inside the budget — trading a real success for a neater number. The race already provides the hard total bound.
+
+The regression test is the important artefact: a provider that **ignores its abort signal entirely** and takes 5 s must still fail with `LLM_TIMEOUT` inside a 120 ms deadline. The earlier hanging-provider test could not catch this, because that fake aborted politely — it tested the happy path of cancellation. Verified the test fails against the old implementation (5001 ms) and passes against the new one.
+
+**Finding — the logger over-redacted its own cost data.** A real query logged `usage: {promptTokens: '[redacted]', responseTokens: '[redacted]'}`. The redaction pattern includes `/token/i`, which matches `promptTokens`, `candidatesTokenCount` and `maxOutputTokens` — so the only cost data the query log carries was being scrubbed, protecting nothing.
+
+Fixed by requiring **two** signals rather than one: a key is redacted when its name looks sensitive **and** its value is not a number or boolean. Every credential this application handles is a string — a JWT, an API key, a bcrypt hash, a password, an `Authorization` header, a cookie — while a token *count* is a number. Strings, objects and arrays under a sensitive key are all still redacted, so `{ authorization: { raw: '…' } }` cannot slip through by nesting.
+
+The residual gap, stated rather than hidden: a secret stored as a *number* would now be logged. No such value exists here, and the alternative — maintaining an allowlist of safe field names — rots the moment someone adds a metric.
+
+**Note — the model id had to change, and that it was a config change is the point.** `gemini-flash-latest` and `gemini-2.5-flash` both returned `503 "This model is currently experiencing high demand"`, and `gemini-2.5-flash-lite` returned 404 for this key. `GEMINI_MODEL=gemini-3.5-flash` answers. Because the model is env-configurable (§10), working around a provider-side capacity problem required no code change and no redeploy — which is exactly why it is a variable and not a constant.
+
+This also confirmed the Phase 4 decision to report the *resolved* model rather than the requested alias: the request asks for `gemini-3.5-flash` and the response reports `gemini-3.6-flash`.
+
+### ⬜ Remaining step for gate 1
+
+✅ **Closed.** A real key is configured and the gate passes:
+
+```
+provider    : gemini
+resolved model : gemini-3.6-flash
+finishReason   : STOP
+usage          : {"promptTokens":10,"responseTokens":29}
+elapsed        : 3538ms
+answer         : "Sunlight reaches Earth's atmosphere and is scattered in all
+                  directions by the gases and particles in the air…"
+```
+
+Verified both through `scripts/smoke-llm.ts` (no HTTP layer) and through `POST /api/query` end to end, with the server log confirming `provider: gemini` and no fake-provider warning at boot. The two defects this immediately exposed are recorded above.
 
 ---
 
@@ -878,6 +917,70 @@ grep -rniE "gemini|AIza[0-9A-Za-z_-]{10,}|JWT_SECRET" dist/   # → no matches
 ✅ Pass when all five hold. Checks 4 and 5 are the security gates and are not optional: check 4 verifies the architecture's central claim, and check 5 verifies that model output is treated as untrusted data (§6).
 
 **Deliberately not working yet:** no container, docs not written.
+
+#### ✅ Outcome — complete
+
+All five gates pass, verified in a **real headless Chrome** rather than by inspection: **43 browser checks** across three passes (31 on the main flow, 7 on session expiry against a backend running `JWT_EXPIRES_IN=3s`, 5 on a real provider timeout with `LLM_PROVIDER=gemini LLM_TIMEOUT_MS=1`). Plus `bun test` at **99 tests** repo-wide — 88 backend, 11 web — and `lint` and `check-types` clean across all three workspaces.
+
+Every error state in gate 2 was *actually triggered*, not reasoned about, which is what the Phase 4 fake provider was built for:
+
+| Trigger | Code shown | Retry offered? |
+| --- | --- | --- |
+| backend stopped | `NETWORK_ERROR` | yes |
+| empty prompt | submit disabled client-side | — |
+| 4001 chars | submit disabled, *"1 character over the 4000 limit"* | — |
+| `!blocked` | `LLM_CONTENT_BLOCKED` | **no** |
+| `!timeout` / real `LLM_TIMEOUT_MS=1` | `LLM_TIMEOUT` | yes |
+| `!ratelimit` | `LLM_RATE_LIMITED` | yes |
+| `!unavailable` | `LLM_UNAVAILABLE` | yes |
+| `!empty` | `LLM_NO_CONTENT` | **no** |
+| token expired | `AUTH_EXPIRED_TOKEN`, returned to login | — |
+
+The retry column is the part worth noting: it is driven by `isRetryableErrorCode` from the shared contract, so the *backend* decides what is worth retrying. A blocked prompt and an empty response get no retry button, because retrying either fails identically and a button that never works teaches the user to distrust the button.
+
+**Gate 4 — no secret in the client bundle.** Exact counts in `dist/`: `gemini` 0, `JWT_SECRET` 0, `DEMO_USER_PASSWORD` 0, `AIza`-shaped keys 0. The only environment value present is `http://localhost:3000`, the API base URL.
+
+One honest clarification: the literal string `demo-password` **is** in the bundle, because `LoginForm` prefills the public demo credential. That is the same reasoning that lets `.env.example` ship a working hash — the password is documented, so publishing it weakens nothing, and what the architecture actually protects is the provider key and the signing secret, neither of which appears. Worth stating rather than quietly scoping the grep to hide it.
+
+**Gate 5 — model output is not rendered as markup.** The fake provider echoes the prompt into its answer, so `<img src=x onerror=alert(1)>` returns through the real response path exactly as a model's output would. In the browser: the payload rendered as **visible text**, the DOM contained `&lt;img`, **no `<img>` element was created**, and an `alert()` trap installed before page load never fired.
+
+That verification lived in a throwaway driver, so it is now also a **committed test** (`apps/web/tests/rendering.test.tsx`): the payload is asserted escaped through the answer body, the model name *and* an error message — every field from the server is untrusted, not just the answer — alongside a structural check that no `dangerouslySetInnerHTML`, `innerHTML =` or `insertAdjacentHTML` exists anywhere in `src/`.
+
+React escapes by default, so these pass today for free, which is exactly why they are worth having: the regression is one `dangerouslySetInnerHTML` added by someone wanting to render markdown, and nothing else in the suite would notice. **Verified that the gate can fail** by temporarily injecting that sink into `ResponsePanel` — 6 tests went red, both behavioural and structural — then reverting. Same discipline as the Phase 1 lint probe: "clean" is indistinguishable from "not looking".
+
+**Gate 3 — abort.** Submitting a second prompt before the first returns leaves exactly one answer panel, containing the second prompt's answer, with the first absent. Without the `AbortController` the two responses race and whichever lands last wins, which is not necessarily the one the user asked for second.
+
+### Findings
+
+**C9 is now definitively not advisory — but the fix removed the Node dependency instead of documenting it.** `bun run dev` failed with `TypeError: crypto.hash is not a function`: Vite 7 requires Node ≥ 20.19 and resolves through its own shebang to the system Node 18. Rather than requiring nvm for the web app the way `lint` does, the scripts now run `bun --bun vite`, which forces Bun to execute Vite's binary itself. `dev`, `build` and `preview` all work with no Node present. **`lint` remains the only task that needs Node ≥ 24.**
+
+**The web app was linting "clean" by not being read at all.** Every `.tsx` file failed with `Parsing error: Unexpected token`, because the shared Babel parser config loads only `@babel/preset-typescript`, which does not enable JSX parsing. ESLint reports that as an error, but it is really the linter being unable to open the file — so a whole app can appear to pass. Fixed with `@babel/plugin-syntax-jsx` in a `**/*.{tsx,jsx}` block: a linter only needs to *parse* JSX, never transform it, so the syntax plugin is smaller and more honest than pulling in `@babel/preset-react`. (The `isTSX`/`allExtensions` options that used to serve this purpose were **removed in Babel 8**, which the first attempt discovered.) This is the third variation of the same Phase 1 finding, and the probe is again the only trustworthy check: a deliberate `.tsx` violation now reports `react-hooks/exhaustive-deps`, `no-dupe-keys` and `no-debugger`.
+
+**`apps/web` uses `@repo/eslint-config/react-internal`, not `base`.** It supplies the browser globals the app actually runs in, and `eslint-plugin-react-hooks` — whose `exhaustive-deps` rule catches the stale-closure bugs that are easy to write in `useCallback` and hard to see in review. The config existed in the repo from create-turbo and was previously unused by anything.
+
+**A console 404 failed the gate, and the cause was a missing favicon.** Browsers request `/favicon.ico` unprompted; `index.html` declared no icon. The gate asserts zero console errors, which is the right strictness — but the failure was noise, and noise is what trains a reviewer to ignore the console, the one place real problems surface. Fixed with an inline SVG `data:` URI, so there is no binary file and no extra request. Found by instrumenting Playwright's `response` and `requestfailed` events rather than by guessing, after a first guess-free check of a plain page load came back empty (the request only happens once the tab renders).
+
+### Decisions
+
+**Direct cross-origin calls, not a Vite proxy.** A dev proxy would make the browser see one origin and CORS would never be exercised — which would leave the backend's explicit allowlist (and the comment explaining why no wildcard) as untested decoration. Calling `http://localhost:3000` from `http://localhost:3020` exercises the real preflight, and the gate's "no CORS errors in the console" check therefore means something. Production collapses to one origin anyway via CloudFront routing `/api/*` to the ALB (§12), which narrows CORS further rather than relying on it.
+
+**`strictPort: true` on 3020.** Without it Vite silently moves to 3021 when 3020 is taken, and every API call then fails a preflight — a confusing console error whose actual cause is a port number. Failing to start is the better outcome, and widening `CORS_ORIGINS` to make the error go away would be the wrong fix.
+
+**The prompt cap comes from `@repo/shared`, not a second hardcoded number.** `PROMPT_MAX_CHARS` is imported by both `QueryForm` and `src/env.ts`'s default, so the client-side mirror cannot drift into permitting a prompt the server rejects — the usual failure being two constants that agree until one is changed. It remains a convenience and never a control: `LLM_MAX_PROMPT_CHARS` is authoritative and enforced regardless.
+
+**No client-side expiry timer.** The token's lifetime is known, so the app *could* pre-emptively sign the user out. It does not: the server is the authority on validity, and a client clock running fast would end a working session while one running slow would keep a dead one. Acting on the server's `AUTH_EXPIRED_TOKEN` is simpler, correct, and means the expiry path is genuinely exercised rather than hidden behind a guess — which is what the 7-check expiry pass confirms, including that signing in again recovers the session.
+
+**The API client validates responses against the shared schemas.** A 2xx body that does not match the contract raises `MALFORMED_RESPONSE` rather than being read as `undefined` — the client-side twin of the Gemini adapter's no-content rule. This matters in practice: a 502 from a load balancer or a 404 from a wrong base URL arrives as HTML, and reading `body.error.code` off HTML is precisely the class of bug the shared contract exists to prevent.
+
+**Client-origin failures are a separate union, not added to `ErrorCode`.** `NETWORK_ERROR` and `MALFORMED_RESPONSE` live in the web app. `ErrorCode` is the wire contract and every member of it has an HTTP status in the backend's translation table; a fetch that never reached the server has no status, so adding it there would force a meaningless one and weaken the exhaustiveness check that makes the table trustworthy.
+
+**A superseded request renders nothing.** `RequestAbortedError` is distinct from `ApiError` so the UI can tell "cancelled" from "failed" — showing "request cancelled" where the new answer is about to appear would be noise. This is what makes gate 3's "exactly one answer, and it is the second" true rather than incidental.
+
+**Memory-only token, stated in the UI itself.** The footer says a refresh signs you out and that this is deliberate, so the trade-off is visible to whoever is demoing rather than looking like a bug. A token in `localStorage` is readable by any script on the page, so one XSS — in the app or any dependency — exfiltrates it, and it outlives the tab to be stolen later.
+
+**Accessibility treated as correctness, not polish.** Labelled controls, `:focus-visible` rings on every interactive element (never `outline: none`), `aria-live="polite"` on the answer so it is announced without interrupting, `aria-live="assertive"` on errors because an error interrupts the task, and the character counter announced only when it is over the limit so a screen reader is not read a running count on every keystroke.
+
+**`turbo.json` build outputs corrected** from the starter's Next-specific `.next/**` globs to `dist/**`, which is the first time `turbo run build` has had real work to cache.
 
 ---
 

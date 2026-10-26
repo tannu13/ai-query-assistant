@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Query Assistant</title>
+    <!--
+      Inline SVG data URI rather than a favicon.ico file. Browsers request
+      /favicon.ico unprompted, so without an icon declared here every page
+      load logs a 404 in the console — which is noise that trains a reviewer
+      to ignore console errors, the one place real problems show up.
+    -->
+    <link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#2f5bd7"/><path d="M9 12h14M9 17h14M9 22h8" stroke="#fff" stroke-width="2.6" stroke-linecap="round" fill="none"/></svg>' />
+    <meta
+      name="description"
+      content="Ask a question and get an answer from an LLM, through a JWT-protected API."
+    />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

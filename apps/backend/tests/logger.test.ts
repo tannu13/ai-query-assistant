@@ -28,6 +28,43 @@ describe('log redaction', () => {
     });
   });
 
+  it('keeps numeric metrics whose names merely contain a sensitive word', () => {
+    /**
+     * Found in live traffic, not by review: the provider's usage block logged
+     * as `{promptTokens: '[redacted]', responseTokens: '[redacted]'}`, because
+     * `/token/i` matches the field names. That protected nothing and threw
+     * away the only cost data the query log carries.
+     */
+    const redacted = redactForLog({
+      usage: { promptTokens: 12, responseTokens: 48 },
+      maxOutputTokens: 1024,
+      candidatesTokenCount: 48,
+      totalTokenCount: 60,
+    });
+
+    expect(redacted).toEqual({
+      usage: { promptTokens: 12, responseTokens: 48 },
+      maxOutputTokens: 1024,
+      candidatesTokenCount: 48,
+      totalTokenCount: 60,
+    });
+  });
+
+  it('still redacts a sensitive key whose value is a string', () => {
+    // The exemption is for numbers only — the name test alone was too blunt,
+    // but loosening it to "anything named token-ish" would be too permissive.
+    expect(
+      redactForLog({ accessToken: 'eyJhbGciOi.payload.sig', refreshToken: 'rt_live' }),
+    ).toEqual({ accessToken: '[redacted]', refreshToken: '[redacted]' });
+  });
+
+  it('redacts an object under a sensitive key rather than recursing into it', () => {
+    // Otherwise a secret slips through simply by being nested one level down.
+    expect(
+      redactForLog({ authorization: { scheme: 'Bearer', raw: 'eyJ-secret' } }),
+    ).toEqual({ authorization: '[redacted]' });
+  });
+
   it('redacts nested values, not only top-level ones', () => {
     // The realistic leak: something logs a whole request or config object
     // rather than naming a secret directly.

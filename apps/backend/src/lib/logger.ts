@@ -73,6 +73,31 @@ export function redactForLog(value: unknown): unknown {
   return redact(value);
 }
 
+/**
+ * A key is redacted when its name looks sensitive **and** its value could
+ * actually carry a credential.
+ *
+ * The name test alone was too blunt, and live traffic showed it: `/token/i`
+ * matches `promptTokens` and `candidatesTokenCount`, so the provider's usage
+ * metrics were logged as `[redacted]` — destroying the cost data the logging
+ * exists to provide, while protecting nothing.
+ *
+ * Numbers and booleans are therefore exempt, because every credential this
+ * application handles is a string: a JWT, an API key, a bcrypt hash, a
+ * password, an Authorization header, a cookie. A token *count* is a number.
+ * Strings, objects and arrays under a sensitive key are all still redacted,
+ * so `{ authorization: { raw: '…' } }` cannot slip through by nesting.
+ *
+ * The residual gap, stated rather than hidden: a secret stored as a number
+ * would now be logged. No such value exists here, and the alternative —
+ * maintaining an allowlist of safe field names — rots the moment someone adds
+ * a metric.
+ */
+function isSensitive(key: string, value: unknown): boolean {
+  if (!SENSITIVE_KEY.test(key)) return false;
+  return typeof value !== 'number' && typeof value !== 'boolean';
+}
+
 function redact(value: unknown, depth = 0): unknown {
   if (value === null || value === undefined) return value;
   if (typeof value === 'string') return truncate(value);
@@ -94,7 +119,7 @@ function redact(value: unknown, depth = 0): unknown {
   if (typeof value === 'object') {
     const out: Record<string, unknown> = {};
     for (const [key, item] of Object.entries(value)) {
-      out[key] = SENSITIVE_KEY.test(key) ? REDACTED : redact(item, depth + 1);
+      out[key] = isSensitive(key, item) ? REDACTED : redact(item, depth + 1);
     }
     return out;
   }

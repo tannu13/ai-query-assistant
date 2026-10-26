@@ -242,19 +242,68 @@ export function createGeminiProvider(
           ? deadline
           : AbortSignal.any([deadline, signal]);
 
+      /**
+       * The deadline is enforced HERE, by racing the call against it, rather
+       * than delegated to the SDK's `abortSignal`.
+       *
+       * That is a correction, not belt-and-braces. The SDK does honour
+       * `abortSignal` in isolation — verified: a 2s signal aborts a request
+       * at 2001ms. But with retries enabled, a retryable failure landing just
+       * before the deadline leaves the *next* attempt's in-flight fetch
+       * unreached by the abort, and the call runs to roughly
+       * `attempts x timeout`. Measured against the live API: 37,598ms against
+       * a 20,000ms deadline, reported as LLM_UNAVAILABLE rather than
+       * LLM_TIMEOUT. A guarantee that holds only when the timing is
+       * favourable is not a guarantee.
+       *
+       * The signal is still passed, because cancelling the upstream request
+       * is what stops it consuming tokens nobody will read. But correctness
+       * no longer depends on it arriving.
+       */
+      const onDeadline = (reject: (error: unknown) => void) => () => {
+        reject(new LlmTimeoutError(timeoutMs, deadline.reason));
+      };
+
+      let detach: (() => void) | undefined;
+      const deadlineReached = new Promise<never>((_resolve, reject) => {
+        const fire = onDeadline(reject);
+        if (deadline.aborted) {
+          fire();
+          return;
+        }
+        deadline.addEventListener('abort', fire, { once: true });
+        detach = () => deadline.removeEventListener('abort', fire);
+      });
+
+      /**
+       * Note `timeoutMs` is passed through as the per-attempt timeout too,
+       * and deliberately NOT sliced into `timeoutMs / attempts`. Slicing
+       * would bound each attempt neatly but would fail a call that
+       * legitimately takes longer than one slice while still finishing inside
+       * the budget — trading a real success for a tidier number. The race
+       * above already provides the hard total bound, so the per-attempt
+       * timeout only needs to not exceed it.
+       */
+      const call = generate({ model, prompt, signal: combined, timeoutMs });
+
+      /**
+       * Keeps a handler attached to the promise the race may abandon. Without
+       * this, a provider that rejects *after* the deadline has already won
+       * produces an unhandled rejection, which under Bun takes the process
+       * down — turning a handled timeout into a crash.
+       */
+      call.catch(() => undefined);
+
       let response: GenerateContentResponse;
       try {
-        response = await generate({
-          model,
-          prompt,
-          signal: combined,
-          timeoutMs,
-        });
+        response = await Promise.race([call, deadlineReached]);
       } catch (error) {
         mapGeminiError(error, {
           timeoutMs,
           deadlineExceeded: deadline.aborted,
         });
+      } finally {
+        detach?.();
       }
 
       return interpretGeminiResponse(response, model);
