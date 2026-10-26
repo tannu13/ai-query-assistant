@@ -1,0 +1,54 @@
+# Build context is the REPOSITORY ROOT (see apps/backend/Dockerfile), because a
+# --frozen-lockfile install in a Bun workspace needs the root `bun.lock` and
+# every workspace manifest. A wider context means a wider blast radius, so the
+# exclusions below matter more than they would for a single-package build.
+
+# --- Secrets. The entire point of this file. ---------------------------------
+# Globbed at every depth, and deliberately covering `.env.test` and friends
+# rather than just `.env`: anything matching this shape is a credential until
+# proven otherwise. `.env.example` is excluded too — it holds placeholders, but
+# the image has no use for it, and an allowlist of "safe" env files is exactly
+# the kind of thing that rots.
+#
+# The Dockerfile also copies named paths instead of `COPY . .`, so a secret
+# would have to defeat both this file and an explicit COPY to reach a layer.
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+
+# --- Never useful in an image ------------------------------------------------
+**/node_modules
+.git
+.gitignore
+**/.turbo
+.claude
+
+# --- Host build output, which the image rebuilds or does not need ------------
+**/dist
+**/build
+**/coverage
+**/*.tsbuildinfo
+**/.eslintcache
+
+# --- Not part of the running service -----------------------------------------
+# The backend runs TypeScript directly, so only `src` is needed at runtime;
+# tests, docs and the plan are context the container should not carry.
+specs
+**/tests
+**/*.test.ts
+**/*.test.tsx
+**/README.md
+AGENTS.md
+DEPLOYMENT.md
+**/eslint.config.js
+
+# The web app and the shared lint config contribute nothing to the API image
+# except their manifests — which a --frozen-lockfile install in a workspace
+# cannot do without (see the Dockerfile header). Excluding the contents and
+# re-admitting the one needed file keeps the context honest about why each
+# path is there.
+apps/web/**
+!apps/web/package.json
+packages/eslint-config/**
+!packages/eslint-config/package.json

@@ -1,7 +1,7 @@
 # AI Query Assistant — Implementation Plan
 
 **Assignment:** Husqvarna Group / GIS India — Take-Home Engineering Exercise, Senior Full Stack Engineer (Cloud & AI Applications)
-**Status:** Phases 0–6 complete on branch `feat/ai-query-assistant` (Phase 4 gate 1 awaits a real `GEMINI_API_KEY` — see its outcome). **Backend and frontend both feature-complete.** Phase 7 next.
+**Status:** Phases 0–7 complete on branch `feat/ai-query-assistant`. **Backend, frontend and container are all done**, each behind a gate that was run rather than reasoned about; the Phase 4 provider round-trip has been re-confirmed from inside the container (Phase 7 check 3). Phase 8 — documentation — next.
 **Budget:** ~3–4 hours, per the brief.
 
 ---
@@ -315,6 +315,7 @@ Correspondingly, `errorHandler` is the only place that converts an exception to 
 | `APP_PORT` | HTTP port | default 3000 |
 | `NODE_ENV` | runtime mode | existing |
 | `APP_STAGE` | dev / prod | existing |
+| `SHUTDOWN_TIMEOUT_MS` | drain budget on SIGTERM | default 8000 — **added in Phase 7**, deliberately under Docker's 10s grace |
 | `JWT_SECRET` | HS256 signing key | min 32 chars, already enforced |
 | `JWT_ISSUER` / `JWT_AUDIENCE` | asserted on verify | new |
 | `JWT_EXPIRES_IN` | token lifetime | default `15m` |
@@ -340,7 +341,9 @@ Only `VITE_API_BASE_URL`. **No key, no model id, nothing secret** — anything i
 
 Multi-stage build on `oven/bun:1.3.13-alpine`.
 
-**The non-obvious constraint:** this is a Bun workspace, so a `--frozen-lockfile` install needs the root `package.json`, the root `bun.lock`, *and* `apps/backend/package.json`. The **build context must therefore be the repository root**, not `apps/backend` — a Dockerfile that assumes its own directory as context cannot resolve the workspace lockfile. The documented build command will make the context explicit.
+**The non-obvious constraint:** this is a Bun workspace, so a `--frozen-lockfile` install needs the root `package.json`, the root `bun.lock`, *and* the workspace manifests. The **build context must therefore be the repository root**, not `apps/backend` — a Dockerfile that assumes its own directory as context cannot resolve the workspace lockfile. The documented build command will make the context explicit.
+
+⚠️ **Stricter than this predicted — measured in Phase 7.** It needs **every one of the five manifests in the lockfile**, not just the backend's, and `--production --filter backend` does not relax that: the workspace graph is resolved before devDependencies are pruned, so a missing `packages/eslint-config/package.json` is resolved against npm and 404s.
 
 - Builder stage installs with the frozen lockfile; runtime stage carries production dependencies only.
 - **No build step.** Bun runs TypeScript directly, so the runtime stage runs `bun src/index.ts` (the `start` script). See the Phase 1 outcome for why a bundling `build` script was tried and removed.
@@ -1021,6 +1024,57 @@ docker run --rm --entrypoint sh ai-query-assistant-api -c 'ls -a /app | grep -F 
 **Deliberately not working yet:** docs.
 
 **Check 5 is the one that matters.** A build that works while leaking `.env` into a layer is worse than no Dockerfile, because the image looks correct and ships the credential. `docker history` will show it even if `ls` does not.
+
+### ✅ Phase 7 outcome — all six checks pass, plus two the gate did not ask for
+
+**Deliverables:** `apps/backend/Dockerfile` (two stages) · root `.dockerignore`. Image is 213MB and builds in ~20s warm.
+
+| Check | Result |
+| --- | --- |
+| 1 — builds from repo-root context | ✅ `docker build -f apps/backend/Dockerfile -t ai-query-assistant-api .` |
+| 2 — runs, reachable from host | ✅ `/health` → 200 `{"status":"ok","uptimeSeconds":3,"stage":"dev"}` |
+| 3 — a real query through the container | ✅ 200, `model: gemini-3.6-flash`, `finishReason: STOP`, 11 prompt / 27 response tokens |
+| 4 — non-root | ✅ `uid=1000(bun)` |
+| 5 — no secret in the image | ✅ see below |
+| 6 — healthcheck wired | ✅ `healthy`, and provably able to go `unhealthy` |
+
+Checks 2 and 3 were run on host port **3100**, not 3000: a `bun --watch` dev server already held 3000. Worth noting rather than silently editing the command — the host port is incidental, and the alternative was killing a process that was not mine to kill.
+
+**Check 5, done properly.** `env | grep -i -e gemini -e jwt` and `ls -a /app | grep .env` both came back empty, as did `find / -xdev -name ".env*"` across the whole filesystem and a `docker history --no-trunc` scan. But the plan's own warning is that `ls` is not the check — so the image was exported with `docker save`, every layer blob decompressed, each tar member read, and the three **live** values from `apps/backend/.env` (the 53-char Gemini key, the 64-char JWT secret, the 80-char hash) searched for as bytes: **0 hits across 25 blobs.**
+
+That scan carried a **positive control** — the string `Server started @`, which was in `src/index.ts` at the time — and found it in 2 blobs. Without that, "0 hits" is equally consistent with having scanned nothing, which is the failure mode of every clean security check. Same discipline as the Phase 1 lint probe and the Phase 6 XSS gate.
+
+**Check 6, with a negative control.** A healthcheck that reports `healthy` proves only that `docker inspect` has a field. Running the image with `--entrypoint sleep` so nothing listens: `starting` → `starting` → **`unhealthy` at ~60s**, failing streak 3, each probe logging `wget: can't connect to remote host (127.0.0.1): Connection refused`. The probe is real.
+
+### Findings
+
+**The workspace constraint is stricter than §11 predicted, and `--production` does not relax it.** §11 said a frozen install needs the root `package.json`, `bun.lock` and `apps/backend/package.json`. Measured: it needs **every one of the five workspace manifests in the lockfile**. With `apps/web/package.json` and the two config packages absent, bun resolved those workspace specifiers against npm, took two 404s, and failed with `lockfile had changes, but lockfile is frozen` — even with `--production --filter backend`, because the workspace graph is resolved before devDependencies are pruned. So all five manifests are copied, and `.dockerignore` excludes `apps/web/**` while re-admitting its one `package.json`.
+
+**`--filter` keeps the web app's dependency tree out of the API image.** `bun install --frozen-lockfile --production --filter backend --filter @repo/shared` installs **240 packages** with no React present. It also switches bun to its isolated linker: the store lands in `node_modules/.bun` at the root, with a symlink farm per workspace pointing into it by *relative* path (`@repo/shared -> ../../../../packages/shared`). All three directories must therefore be copied, and their relative positions are load-bearing — a flattened copy would break every resolution.
+
+**`bcrypt` needs no build toolchain on Alpine.** The one dependency with a native binding ships prebuilds including `prebuilds/linux-x64/bcrypt.musl.node`, verified by a round-trip `hashSync`/`compareSync` inside the image. No `python3`/`make`/`g++` layer, which is the usual reason an Alpine Node image is 400MB.
+
+**🔧 SIGTERM was ignored, and the container gate is what caught it.** `docker stop` took **10,163ms** and the container exited **137** — Docker's SIGKILL after its grace period. Not cosmetic: a single LLM call may run up to `LLM_TIMEOUT_MS` (20s), so every in-flight query was being severed mid-`await`, and since a rolling deploy SIGTERMs every task by design, *deploy* and *drop live requests* were the same event.
+
+Fixed in `src/index.ts`: stop accepting connections, drain in-flight requests, close **idle** keep-alive sockets only (`closeAllConnections` would kill the very requests this protects), and exit 0 — behind a new `SHUTDOWN_TIMEOUT_MS` (default 8000, deliberately under Docker's 10s grace, documented as needing to stay under whatever the orchestrator allows). A second signal force-exits rather than restarting the clock.
+
+Verified three ways: idle `docker stop` → **125ms, exit 0**; and SIGTERM sent **600ms into a live Gemini call** → the server waited **3,777ms**, the client received a full **HTTP 200 with the real answer**, and the process exited 0. Bun's `node:http` implements `close`, `closeIdleConnections` and `closeAllConnections`, so no Bun-specific workaround was needed.
+
+`src/index.ts` also moved from `console.log` to the structured logger, which it should have been using since Phase 2 — the one line in the codebase that was not.
+
+### Decisions
+
+**Explicit `COPY` paths, never `COPY . .`.** Combined with `.dockerignore`, a `.env` has to defeat two independent controls to reach a layer. One control that is easy to get right beats two that are easy to forget, but here the second is nearly free: the Dockerfile has to name `apps/backend/src` and `packages/shared/src` anyway to keep the dependency layer cacheable.
+
+**`.dockerignore` globs env files at every depth and does not re-admit `.env.example`.** `**/.env` plus `**/.env.*` catches `.env.test` and anything else of that shape, on the rule that a file matching it is a credential until proven otherwise. An allowlist of "safe" env files is exactly the thing that rots the first time someone adds `.env.staging`.
+
+**No build stage, because there is nothing to build.** Bun executes TypeScript directly, so `src` *is* the artifact (see the Phase 1 outcome for the bundling step that was tried and removed). The two stages still earn their place: the install's download cache and the full build context stay in `deps` and never reach the runtime image.
+
+**Application files stay root-owned while the process runs as `bun`.** `USER bun` is what makes the container non-root — the base image's default user is root, so omitting that line silently gives up the property. Not using `--chown` is the other half: the service cannot rewrite its own code at runtime.
+
+**Busybox `wget`, not curl, for the healthcheck.** The base image has no curl, and installing one spends ~4MB to duplicate something already present. `/health` stays unauthenticated and deliberately does **not** call the provider: a probe costing a token per run would make liveness a recurring expense and would turn a provider outage into a restart loop.
+
+**Bun pinned to 1.3.13 via `ARG`,** matching the root `package.json`'s `devEngines`, so the container and a developer's machine run the same runtime rather than drifting apart at the next base-image rebuild.
 
 ---
 

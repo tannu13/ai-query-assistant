@@ -20,6 +20,18 @@ const EnvSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   APP_STAGE: z.enum(['dev', 'prod']).default('dev'),
 
+  /**
+   * How long a SIGTERM'd process may spend draining in-flight requests
+   * before it stops waiting and exits (see src/index.ts).
+   *
+   * The default is deliberately under Docker's 10s default grace period, so
+   * the process exits on its own terms with a logged reason instead of being
+   * SIGKILLed with none. Raise it where the orchestrator's own timeout is
+   * larger — ECS `stopTimeout` defaults to 30s — but it should always stay
+   * below that timeout, or the setting has no effect.
+   */
+  SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(8_000),
+
   /** bcrypt cost factor, used when hashing and comparing the demo password. */
   SALT_ROUNDS: z.coerce.number().positive().default(10),
 
