@@ -2,7 +2,9 @@ import { errorEnvelopeSchema } from '@repo/shared';
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import express from 'express';
 
+import env from '../src/env';
 import { AppError } from '../src/lib/errors';
+import { DEMO_USER_ID, signAccessToken } from '../src/services/token';
 import errorHandler from '../src/middleware/errorHandler';
 import notFound from '../src/middleware/notFound';
 import requestId, { REQUEST_ID_HEADER } from '../src/middleware/requestId';
@@ -155,9 +157,16 @@ describe('errorHandler', () => {
     });
 
     it('rejects an invalid body with field-level details', async () => {
-      const response = await fetch(`${realServer.url}/api/echo`, {
+      // Authenticated, because `requireAuth` runs before validation: an
+      // unauthenticated malformed body is a 401, and testing validation
+      // through a 401 would assert nothing.
+      const { token } = signAccessToken(DEMO_USER_ID, env.DEMO_USER_EMAIL);
+      const response = await fetch(`${realServer.url}/api/query`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          authorization: `Bearer ${token}`,
+        },
         body: JSON.stringify({ prompt: '   ' }),
       });
       const parsed = errorEnvelopeSchema.parse(await response.json());
@@ -170,7 +179,9 @@ describe('errorHandler', () => {
     });
 
     it('rejects malformed JSON in the envelope rather than as HTML', async () => {
-      const response = await fetch(`${realServer.url}/api/echo`, {
+      // No token needed: `express.json` is mounted app-wide and fails before
+      // the router runs, which is exactly why this hole had to be closed.
+      const response = await fetch(`${realServer.url}/api/query`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: '{"prompt": ',
@@ -187,7 +198,7 @@ describe('errorHandler', () => {
       // before any application code runs, and Express's default handler
       // answers it with an HTML page. This is the assertion that the
       // single-envelope guarantee has no hole at the transport layer.
-      const response = await fetch(`${realServer.url}/api/echo`, {
+      const response = await fetch(`${realServer.url}/api/query`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt: 'x'.repeat(2_000_000) }),

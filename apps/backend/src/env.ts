@@ -81,6 +81,17 @@ const EnvSchema = z.object({
     .min(10, 'GEMINI_API_KEY is too short to be a real key'),
   GEMINI_MODEL: z.string().min(1).default('gemini-flash-latest'),
 
+  /**
+   * Which implementation of the LlmProvider seam to use.
+   *
+   * `fake` exists so the frontend's error states and the full request path
+   * can be demonstrated without spending tokens — every failure in the error
+   * matrix is reachable from a prompt prefix. It is refused when
+   * APP_STAGE=prod by the check below: a deployment silently serving canned
+   * answers is a worse outcome than a deployment that will not start.
+   */
+  LLM_PROVIDER: z.enum(['gemini', 'fake']).default('gemini'),
+
   /** Upper bound on a single provider call before it is aborted. */
   LLM_TIMEOUT_MS: z.coerce.number().int().positive().default(20_000),
   /**
@@ -113,6 +124,22 @@ const EnvSchema = z.object({
  * read: the decoded password hash. Keeping the raw and decoded forms under
  * different names means no call site has to remember which it is holding.
  */
+/**
+ * Cross-field rules, which belong here rather than at the use site: a
+ * misconfiguration should stop the process at boot, not surface on the first
+ * request that happens to exercise it.
+ */
+const ValidatedEnvSchema = EnvSchema.superRefine((value, ctx) => {
+  if (value.LLM_PROVIDER === 'fake' && value.APP_STAGE === 'prod') {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['LLM_PROVIDER'],
+      message:
+        'LLM_PROVIDER=fake is not permitted when APP_STAGE=prod — it would serve canned answers from a production deployment',
+    });
+  }
+});
+
 type Env = z.infer<typeof EnvSchema> & {
   /** Decoded from DEMO_USER_PASSWORD_HASH_B64, already shape-validated. */
   DEMO_USER_PASSWORD_HASH: string;
@@ -120,7 +147,7 @@ type Env = z.infer<typeof EnvSchema> & {
 
 let env: Env;
 try {
-  const parsed = EnvSchema.parse(process.env);
+  const parsed = ValidatedEnvSchema.parse(process.env);
   env = {
     ...parsed,
     // Guaranteed to match BCRYPT_HASH: the refine above already decoded and

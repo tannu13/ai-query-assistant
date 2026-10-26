@@ -1,7 +1,7 @@
 # AI Query Assistant — Implementation Plan
 
 **Assignment:** Husqvarna Group / GIS India — Take-Home Engineering Exercise, Senior Full Stack Engineer (Cloud & AI Applications)
-**Status:** Phases 0–3 complete on branch `feat/ai-query-assistant`. Phase 4 next.
+**Status:** Phases 0–5 complete on branch `feat/ai-query-assistant` (Phase 4 gate 1 awaits a real `GEMINI_API_KEY` — see its outcome). **The backend is feature-complete.** Phase 6 next.
 **Budget:** ~3–4 hours, per the brief.
 
 ---
@@ -255,7 +255,9 @@ This is a concrete, provider-specific demonstration of "thoughtfully handling LL
 
 The timeout lives **in the adapter**, not the route, so the `LlmProvider` interface stays provider-agnostic. Preference order: the SDK's own `httpOptions` timeout / abort-signal support if present; otherwise an `AbortSignal.timeout()` wrapper at the adapter boundary. Default 20s, env-configurable.
 
-On retry: because the SDK already bundles `p-retry`, **its built-in behaviour will be checked before any retry layer is added.** Stacking a hand-rolled backoff on top of an SDK that already retries silently multiplies worst-case latency, and it is a bug that looks like diligence. Whatever is concluded gets one line in the README — "I checked what the SDK does natively" is a better answer than an unexamined backoff loop.
+On retry: because the SDK already bundles `p-retry`, **its built-in behaviour will be checked before any retry layer is added.** Stacking a hand-rolled backoff on top of an SDK that already retries silently multiplies worst-case latency, and it is a bug that looks like diligence.
+
+⚠️ **Checked in Phase 4, and the concern was backwards.** Retry is *off* unless `httpOptions.retryOptions` is passed — the client returns early when it is absent — so the risk was never double-retrying but not retrying at all while assuming the SDK had it covered. See the Phase 4 outcome for the configuration chosen and why 429 is excluded from it.
 
 ---
 
@@ -292,6 +294,7 @@ Every error response, from every route, has one shape:
 | LLM 429 | adapter error mapping, `Retry-After` honoured | `LLM_RATE_LIMITED` | 429 |
 | LLM 5xx / transport failure | adapter error mapping | `LLM_UNAVAILABLE` | 502 |
 | **200 with no content (input blocked)** | adapter response inspection | `LLM_CONTENT_BLOCKED` | 422 |
+| **200 with no content (output policy stop)** | adapter response inspection — refined in Phase 4 | `LLM_CONTENT_BLOCKED` | 422 |
 | **200 with no content (other)** | adapter response inspection | `LLM_NO_CONTENT` | 502 |
 | Anything unhandled | `errorHandler` | `INTERNAL_ERROR` | 500 |
 
@@ -698,6 +701,76 @@ bun test tests/gemini.adapter.test.ts
 
 **Why the smoke script is the gate:** it isolates "does the SDK work the way §8 assumes" from "is the route wired correctly". If the first real query fails only at Phase 5, the cause is ambiguous across two layers. This is also the phase where §8's central claim — Gemini returning HTTP 200 with no usable text — is confirmed against the actual SDK types instead of taken on trust.
 
+#### ⚠️ Outcome — complete except gate 1, which needs a real API key
+
+Gates 2, 3 and 4 pass. **Gate 1 (a real round-trip returning model output) is unverified**: `GEMINI_API_KEY` in `apps/backend/.env` is still the Phase 1 placeholder, and the project owner chose to continue rather than pause for it. Everything up to the provider's front door is confirmed against the real SDK over the real network — see below — and the one remaining step is a single command, recorded at the end of this section.
+
+`bun test` green at **70 tests across 5 files**, 33 of them in `tests/gemini.adapter.test.ts`.
+
+**Gate 2 — the timeout path, against the real SDK.** `LLM_TIMEOUT_MS=1 bun run scripts/smoke-llm.ts "hello"` produces `LLM_TIMEOUT` / 504 in 6ms with `context: {"timeoutMs":1}`, and exits 1. Not a hang and not an unhandled rejection.
+
+**Partial gate 1 — the error path is confirmed end to end against the live API.** Run with the placeholder key, the smoke script reaches `generativelanguage.googleapis.com`, receives a genuine HTTP 400 `API_KEY_INVALID`, and returns `LLM_UNAVAILABLE` / 502 with the client-facing message *"The model is temporarily unavailable. Please try again."* The provider's own text — `"API key not valid"`, the project metadata, the service name — appears **only** in `cause`, which only the logger reads. So the §9 rule is verified against a real provider error rather than a fabricated one, which is the harder half of the claim; what remains unverified is only the success path.
+
+### §17 items 1–4 — answered against the installed SDK
+
+Read out of `@google/genai@2.31.0`'s type definitions and shipped JavaScript, not its README.
+
+**1. `httpOptions` timeout and abort-signal support — both exist, and they compose.** `HttpOptions.timeout` is milliseconds, and `GenerateContentConfig.abortSignal` is a real `AbortSignal`. The plan's fallback (an `AbortSignal.timeout()` wrapper at the adapter boundary) is not needed — but reading `createAttemptSignal` in the shipped code showed the two mean *different* things:
+
+- `httpOptions.timeout` bounds **each attempt**; the SDK builds a fresh signal per attempt from it.
+- `abortSignal` is the **same object across every attempt**, so it bounds the whole sequence, backoff included. `onFailedAttempt` also re-throws immediately if it has aborted.
+
+The adapter therefore sets both: `timeout` per attempt, and an `AbortSignal.timeout(LLM_TIMEOUT_MS)` composed with the caller's signal via `AbortSignal.any()` as the hard ceiling. Without the second, `attempts × timeout + backoff` would be the real worst case and the configured deadline would be fiction.
+
+**2. `FinishReason` and `BlockedReason` enum members — the plan guessed the type name wrong.** It is `BlockedReason`, not `BlockReason`. `FinishReason` has **19** members and `BlockedReason` has **8**:
+
+| | Members |
+| --- | --- |
+| `FinishReason` | `FINISH_REASON_UNSPECIFIED`, `STOP`, `MAX_TOKENS`, `SAFETY`, `RECITATION`, `LANGUAGE`, `OTHER`, `BLOCKLIST`, `PROHIBITED_CONTENT`, `SPII`, `MALFORMED_FUNCTION_CALL`, `IMAGE_SAFETY`, `UNEXPECTED_TOOL_CALL`, `TOO_MANY_TOOL_CALLS`, `IMAGE_PROHIBITED_CONTENT`, `NO_IMAGE`, `IMAGE_RECITATION`, `IMAGE_OTHER`, `CONTINUATION` |
+| `BlockedReason` | `BLOCKED_REASON_UNSPECIFIED`, `SAFETY`, `OTHER`, `BLOCKLIST`, `PROHIBITED_CONTENT`, `IMAGE_SAFETY`, `MODEL_ARMOR`, `JAILBREAK` |
+
+Most are image- or tool-specific and irrelevant here. The eight that mean "the model declined" are enumerated in the adapter as `CONTENT_BLOCKED_FINISH_REASONS`, declared `as const satisfies readonly FinishReason[]` so an SDK upgrade that renames one is a compile error rather than a case silently falling through to `LLM_NO_CONTENT`.
+
+**3. The SDK's `p-retry` behaviour — retry is OFF by default, which inverts the plan's concern.** §8 worried that stacking a hand-rolled backoff on an SDK that already retries would multiply worst-case latency. The shipped `apiCall` says otherwise:
+
+```js
+if (!retryOptions) {
+  return runFetch();   // no retry at all
+}
+```
+
+Nothing retries until `httpOptions.retryOptions` is supplied — the documented defaults (5 attempts, 1s initial delay, 60s max, base 2, jitter, on 408/429/5xx) apply only *once you opt in*. So the risk was never double-retrying; it was **not retrying at all** while believing the SDK had it covered.
+
+Opted in, but not with those defaults, which are lifted from a Cloud Storage retry strategy: inside a request with a human waiting, a single 503 would spend 1+2+4+8 = 15 seconds in `setTimeout` alone. The adapter uses `attempts: 2`, `initialDelay: 0.5`, `maxDelay: 2` — one extra attempt recovers a transient blip and costs little — and restricts `httpStatusCodes` to `[408, 500, 502, 503, 504]`. **429 is excluded on purpose:** retrying a rate limit inside the request burns the caller's deadline and adds load to the service that just asked for less. It belongs in the client's hands, which is exactly why `LLM_RATE_LIMITED` is a retryable code in the shared contract and carries `Retry-After`.
+
+**4. `response.text` is a property, not a method.** `get text(): string | undefined` — a getter, so the README's property access is right, and the `| undefined` is the whole point of §8. This detail also changed the tests: a plain object literal with a `text` field would not reproduce a getter, so the fixtures use `Object.defineProperty(response, 'text', { get })` to be faithful rather than approximately right.
+
+### Decisions
+
+**Output-side safety stops map to `LLM_CONTENT_BLOCKED` (422), not `LLM_NO_CONTENT` (502) — a deliberate refinement of §9's matrix.** The matrix split "200 with no content" into *input blocked* → 422 and *other* → 502. But a `finishReason` of `SAFETY`, `RECITATION`, `BLOCKLIST`, `PROHIBITED_CONTENT` or `SPII` is not an outage: the provider answered, and its answer was a refusal. A 502 would claim the upstream is broken, send an operator hunting a non-existent incident, and — because `LLM_UNAVAILABLE`-class codes are the retryable ones — invite the UI to offer a retry for a prompt that will fail identically every time. `LLM_NO_CONTENT` is now reserved for genuinely inexplicable emptiness.
+
+**Truncation is surfaced with the text, never discarded.** `MAX_TOKENS` with text returns `truncated: true` alongside a usable partial answer — a third outcome that is neither success nor failure, which the UI can say out loud. `MAX_TOKENS` with *no* text is still `LLM_NO_CONTENT`: the limit can be consumed entirely by reasoning tokens, and truncated-and-empty is still empty. Both covered by tests.
+
+**The adapter reports the resolved model, not the requested alias.** `gemini-flash-latest` is an alias; `response.modelVersion` is what actually answered. Reporting the resolved value is what makes a log line reproducible months later, when the alias points somewhere else.
+
+**The interesting logic is pure and exported, so it is tested directly rather than mocked.** `interpretGeminiResponse` and `mapGeminiError` are pure functions, and `createGeminiProvider` takes an injectable `generate`. No mocking library, no network, and the SDK's own `ApiError` and `FinishReason` are used in the fixtures — so the tests fail if the SDK's shapes change, which a hand-rolled mock would not.
+
+**The fake provider is reachable at runtime, and refused in production.** `LLM_PROVIDER=fake` serves deterministic answers, and prompt prefixes (`!empty`, `!blocked`, `!timeout`, `!ratelimit`, `!unavailable`, `!truncated`, `!hang`) make every row of the error matrix reachable from the UI with no token spend — which is what makes Phase 6's "each error state actually triggered" gate achievable rather than aspirational. `env.ts` refuses `fake` when `APP_STAGE=prod` via a `superRefine`, and `services/llm/index.ts` refuses it again, because a production deployment silently serving canned answers is a worse outcome than one that will not start. The smoke script also prints a loud warning when it is running against the fake: a smoke check that cannot fail is not a smoke check.
+
+**The smoke script exits non-zero**, distinguishing 1 (a typed `AppError`, i.e. the adapter did its job) from 2 (an unmapped throw, i.e. it did not). That makes it usable as a deployment smoke check rather than something read by eye.
+
+### ⬜ Remaining step for gate 1
+
+Put a real Google AI Studio key in `apps/backend/.env` (`GEMINI_API_KEY=…`, from https://aistudio.google.com/apikey), then:
+
+```sh
+cd apps/backend && bun run scripts/smoke-llm.ts "Why is the sky blue?"
+# expect: exit 0, real answer text, a resolved model id more specific than
+# `gemini-flash-latest`, finishReason STOP, and a usage block.
+```
+
+Nothing else depends on it: the adapter, its tests, and Phases 5–6 are verified through the injected `generate` seam and `LLM_PROVIDER=fake`.
+
 ---
 
 ### Phase 5 — `POST /api/query` · ~20m
@@ -731,6 +804,45 @@ bun test      # all suites
 **Deliberately not working yet:** no UI — the API is complete and curl-verifiable.
 
 **Backend is feature-complete at this gate.** Everything after this phase is presentation, packaging, and documentation. If the budget overruns, this is the point at which what exists is already a coherent, defensible submission.
+
+#### ✅ Outcome — complete
+
+All six gates pass; `bun test` green at **88 tests across 6 files**. The happy path returns `{answer, model, finishReason, truncated, requestId, usage}` with `requestId` equal to the `X-Request-Id` header; unauthenticated → `AUTH_MISSING_TOKEN`; empty prompt → `VALIDATION_FAILED` with `details[0].path === "prompt"`; a 4001-character prompt → 400 **with zero provider calls** (asserted both by log-line count against the running server and by a `spyOn` assertion of `toHaveBeenCalledTimes(0)`); `LLM_TIMEOUT_MS=1` against the real Gemini adapter → 504 `LLM_TIMEOUT`; and `/api/echo` is gone, answering `NOT_FOUND`.
+
+Verified through `LLM_PROVIDER=fake`, so every row of the error matrix was exercised end to end over HTTP — `!timeout` → 504, `!ratelimit` → 429 with `Retry-After`, `!unavailable` → 502, `!blocked` → 422, `!empty` → 502 — with no network and no token spend. This is the payoff of the Phase 4 seam: these are the rows that are nearly impossible to trigger against a live provider on demand.
+
+**Finding — the planned client-disconnect cancellation is not implementable on this stack, and was removed rather than shipped.** The route originally aborted the upstream call when the browser went away, so an abandoned request would stop costing tokens. It was wired the conventional way, on `res.on('close')`. A test asserting the provider's signal actually aborted failed — and four probes against Bun 1.3.13 + Express 5 explain why:
+
+| Event | POST, client disconnects | POST, completes normally |
+| --- | --- | --- |
+| `req` `close` | **+0ms** (body consumed) | **+0ms** (body consumed) |
+| `req.destroyed` | **true at +102ms**, before the 300ms abort | true early, same reason |
+| `req` `aborted` | never | never |
+| `res` `close` | **never** | +2001ms |
+| `res` `finish` | **never** | +2000ms |
+| `socket` `close` / `socket.destroyed` | never / stays false | — |
+
+So under Bun's `node:http` compatibility layer the events are the reverse of Node's: `res.on('close')` fires exactly when it is *not* needed and stays silent when it is, while `req`'s signals describe the request *body* stream rather than the connection and so fire identically whether the client is there or not. There is no usable server-side disconnect signal for a POST.
+
+Three consequences, all now reflected in the code:
+
+1. **The route no longer pretends to cancel.** Shipping the wiring would have looked like working cancellation while doing nothing — strictly worse than not having it, because it would be believed. The measurement is recorded in `routes/query.ts` so the next person does not re-derive it.
+2. **An intermediate "fix" was itself a bug, caught by the same measurement.** Having found that `req.on('close')` fires on disconnect for a GET, the access logger was changed to log `abandoned` from it. Because `req` `close` fires at +0ms for *every* POST, that would have labelled every single POST abandoned. Reverted to `res.on('finish')` alone. The lesson is the generalisable one: the first probe used a GET, and the behaviour that mattered only differs on a request *with a body*.
+3. **The honest limitation is stated rather than hidden.** A request whose client goes away mid-flight produces no access line, and its upstream call runs to completion or to `LLM_TIMEOUT_MS`. The adapter's own deadline still bounds every call, so nothing can pin a request open indefinitely. The capability arrives free by running on Node, or by serving with `Bun.serve`, whose `Request.signal` aborts on disconnect — recorded for the README's known-limitations section.
+
+The `LlmCompleteInput.signal` seam stays, and stays unit-tested: the adapter honours a caller signal and composes it with its own deadline. Only the HTTP-layer *source* of that signal is unavailable, which is a different thing from the seam being wrong.
+
+**Decision — `requireAuth` runs before validation, and before the rate limiter.** The order on the route is not interchangeable. Auth first, so an unauthenticated caller gets `AUTH_MISSING_TOKEN` rather than a description of the request shape they have no access to — asserted by a test that sends an invalid body with no token and expects 401, not 400. Rate limiter second, because it keys on `req.auth.subject`, which only exists after auth.
+
+**Decision — the rate limiter keys on the JWT subject, and the test proves it.** An IP key puts an entire office behind a shared NAT into one bucket while handing an attacker with a handful of addresses a fresh budget per address; the limit should follow the account. The test demonstrates this from the inverse direction, which is the only way to actually prove the key: two different subjects calling from the *same* loopback address get independent budgets — exhaust subject A at capacity 20, and subject B's next call still returns 200. An IP-keyed limiter would have rejected it.
+
+Worth recording what the first version of that test got wrong: it signed two tokens for the same subject and asserted they differed. They were byte-identical, because identical claims signed within the same second produce the same JWT. The assertion was not just failing, it was meaningless — and replacing it forced the better test above.
+
+**Decision — validation precedes everything that costs money, and that is asserted rather than assumed.** A test that only checked for a 400 on an oversized prompt would pass just as happily with the provider call left in front of it. The `spyOn(...).toHaveBeenCalledTimes(0)` assertion is what makes the ordering a guarantee. A boundary test (`exactly LLM_MAX_PROMPT_CHARS` → 200) guards the off-by-one on the limit the UI mirrors.
+
+**Decision — the route has no `try`/`catch`.** Every provider failure is already a typed `AppError` and the single translation middleware owns the response, so a catch here could only make the envelope inconsistent. A test confirms the other half: when the provider throws something *untyped*, the route does not dress it up — it collapses to `INTERNAL_ERROR` with the provider's message, endpoint and credential fragment absent from the serialised response.
+
+**Note — the transport-layer error tests moved from `/api/echo` to `/api/query`.** With the scaffolding gone they now exercise the real endpoint. Two of the three need no token, which is itself the point: `express.json` is mounted app-wide and fails before the router runs, which is exactly why that hole had to be closed in Phase 2.
 
 ---
 
@@ -865,10 +977,10 @@ Ordering is deliberate: Phase 0 prevents the unrecoverable mistake, Phase 1 unbl
 
 Assumptions this plan has **not** confirmed. Items 1–4 are resolved in **Phase 4** and item 5 in **Phase 2**; each is checked against the installed SDK rather than trusted, and the answers are written back into this document.
 
-1. **`httpOptions` timeout / `abortSignal` support** in `@google/genai` v2.31.0 — the published README has no timeout or cancellation section. If absent, fall back to an `AbortSignal.timeout()` wrapper at the adapter boundary (§8).
-2. **Exact `finishReason` and `blockReason` enum values and their TypeScript names** — the failure mode in §8 is real, but the specific enum members must be read from the SDK's type definitions, not assumed.
-3. **The SDK's native `p-retry` behaviour** — how many attempts, on which status codes, before deciding whether any retry layer is warranted (§8).
-4. **Whether `response.text` is a property or a method** in v2.31.0 — the README shows property access; confirm against the types.
+1. ~~**`httpOptions` timeout / `abortSignal` support**~~ — **resolved in Phase 4.** Both exist. `httpOptions.timeout` (ms) bounds each attempt; `config.abortSignal` is reused across attempts and so bounds the whole sequence. The adapter uses both; no wrapper fallback needed.
+2. ~~**Exact `finishReason` and `blockReason` enum values and their TypeScript names**~~ — **resolved in Phase 4.** The type is `BlockedReason`, not `BlockReason`. 19 `FinishReason` members and 8 `BlockedReason` members, both listed in the Phase 4 outcome.
+3. ~~**The SDK's native `p-retry` behaviour**~~ — **resolved in Phase 4.** Retry is OFF unless `retryOptions` is passed. Opted in with 2 attempts / 0.5s initial delay, 429 excluded.
+4. ~~**Whether `response.text` is a property or a method**~~ — **resolved in Phase 4.** A getter: `get text(): string | undefined`. The `| undefined` is the failure mode §8 is built around.
 5. ~~**`express.json({ limit })` interaction with the prompt cap**~~ — **resolved in Phase 2.** An oversized body is rejected by body-parser as an `http-errors` instance with `type: 'entity.too.large'` before application code runs, so the prompt cap is never consulted and the default handler would answer with HTML. `errorHandler` maps all seven body-parser `type` values to `VALIDATION_FAILED`; covered by two tests.
 
 ---

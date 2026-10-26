@@ -154,6 +154,86 @@ export class AuthInvalidCredentialsError extends AppError {
 }
 
 /**
+ * The provider did not answer inside the configured deadline.
+ *
+ * 504 rather than 500: the failure is upstream of this service, and the
+ * distinction tells an operator which dashboard to open.
+ */
+export class LlmTimeoutError extends AppError {
+  constructor(timeoutMs: number, cause?: unknown) {
+    super(
+      'LLM_TIMEOUT',
+      'The model did not respond in time. Please try again.',
+      { cause, context: { timeoutMs } },
+    );
+  }
+}
+
+export class LlmRateLimitedError extends AppError {
+  constructor(retryAfterSeconds: number, cause?: unknown) {
+    super(
+      'LLM_RATE_LIMITED',
+      'The model is receiving too many requests right now. Please try again shortly.',
+      { cause, retryAfterSeconds },
+    );
+  }
+}
+
+/**
+ * Covers every upstream fault the caller can do nothing about: 5xx, transport
+ * failure, and — deliberately — provider-side rejections of *our* request,
+ * such as an invalid API key or an unknown model id. From the client's seat
+ * those are all "the service behind this one is not working", and telling a
+ * user that an API key is invalid would leak our configuration state.
+ */
+export class LlmUnavailableError extends AppError {
+  constructor(cause?: unknown, context?: Record<string, unknown>) {
+    super(
+      'LLM_UNAVAILABLE',
+      'The model is temporarily unavailable. Please try again.',
+      { cause, context },
+    );
+  }
+}
+
+/**
+ * The provider refused on content-policy grounds — either the prompt tripped
+ * an input filter, or generation stopped on a safety or recitation reason.
+ *
+ * 422 rather than 502, because nothing is broken: the provider answered, and
+ * its answer was a refusal. A 502 would send an operator hunting an outage
+ * that is not happening, and would mark the failure retryable when retrying
+ * the identical prompt will fail identically.
+ */
+export class LlmContentBlockedError extends AppError {
+  constructor(reason: string, cause?: unknown) {
+    super(
+      'LLM_CONTENT_BLOCKED',
+      'The model declined to answer this prompt. Try rephrasing it.',
+      { cause, context: { reason } },
+    );
+  }
+}
+
+/**
+ * HTTP 200 with no usable text, for a reason that is not a content block.
+ *
+ * This is the failure mode that makes the adapter worth having: the naive
+ * implementation returns `response.text` straight through, the UI renders
+ * `undefined`, and no error is raised anywhere. Treated as a first-class
+ * failure, never as an empty success.
+ */
+export class LlmNoContentError extends AppError {
+  constructor(context?: Record<string, unknown>, cause?: unknown) {
+    super(
+      'LLM_NO_CONTENT',
+      'The model returned an empty response. Please try again.',
+      { cause, context },
+    );
+  }
+}
+
+/**
  * Generic message for anything that reaches the error handler unwrapped.
  *
  * Deliberately says nothing about the cause: the request id in the same

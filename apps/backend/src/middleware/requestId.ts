@@ -30,6 +30,23 @@ export function requestId(req: Request, res: Response, next: NextFunction): void
   req.log = logger.child({ requestId: id });
   res.setHeader(REQUEST_ID_HEADER, id);
 
+  /**
+   * One access line per completed response.
+   *
+   * `res.on('finish')` only, which is a deliberate limit rather than an
+   * oversight: under Bun's `node:http` layer a client disconnect produces no
+   * `res` event at all, and `req`'s `close` fires as soon as the request body
+   * is consumed — so there is nothing to distinguish an abandoned request
+   * from a normal one at that point. A `req.on('close')` listener here would
+   * therefore label **every** POST "abandoned" at +0ms, which is worse than
+   * the gap it was meant to close. See `routes/query.ts` for the full
+   * measurement.
+   *
+   * The honest consequence, worth stating because it affects what the logs
+   * can be used for: a request whose client goes away mid-flight produces no
+   * access line. On Node, or behind an access log at the load balancer, it
+   * would.
+   */
   const startedAt = performance.now();
   res.on('finish', () => {
     req.log.info('request completed', {

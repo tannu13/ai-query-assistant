@@ -79,6 +79,20 @@ export function errorHandler(
     return;
   }
 
+  /**
+   * The socket is gone, so there is nothing to answer on. Log it and stop,
+   * rather than writing to a destroyed stream and turning one failure into
+   * two.
+   */
+  if (res.destroyed || !res.writable) {
+    (req.log ?? logger).warn('request abandoned before a response was sent', {
+      method: req.method,
+      path: req.originalUrl,
+      err: error,
+    });
+    return;
+  }
+
   const appError = toAppError(error);
   const requestId = req.requestId ?? 'unassigned';
   const log = req.log ?? logger;

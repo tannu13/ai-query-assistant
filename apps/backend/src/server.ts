@@ -7,9 +7,9 @@ import errorHandler from './middleware/errorHandler';
 import notFound from './middleware/notFound';
 import requestId from './middleware/requestId';
 import authRouter from './routes/auth';
-import echoRouter from './routes/echo';
 import healthRouter from './routes/health';
 import meRouter from './routes/me';
+import queryRouter from './routes/query';
 
 /**
  * Transport-level body cap, derived from the domain-level prompt cap rather
@@ -68,7 +68,7 @@ app.use(express.json({ limit: JSON_BODY_LIMIT_BYTES }));
 app.use(healthRouter);
 app.use(authRouter);
 app.use(meRouter);
-app.use(echoRouter); // TEMPORARY — removed in Phase 5.
+app.use(queryRouter);
 
 app.use(notFound);
 app.use(errorHandler);
