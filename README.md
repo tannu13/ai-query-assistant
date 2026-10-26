@@ -160,6 +160,7 @@ Without the header, the same call returns `401 AUTH_MISSING_TOKEN`.
 | Method | Path | Auth | Purpose |
 | --- | --- | --- | --- |
 | `GET` | `/health` | — | Liveness. Does **not** call the LLM provider |
+| `GET` | `/ready` | — | Readiness. 200 `ready`, or 503 `draining` once a shutdown has begun |
 | `POST` | `/api/auth/login` | — | Demo credentials → 15-minute HS256 JWT |
 | `GET` | `/api/me` | Bearer | The verified claims behind the current token |
 | `POST` | `/api/query` | Bearer | `{ prompt }` → an answer |
@@ -234,7 +235,7 @@ bun run test            # everything, via turbo
 bun run check-types     # tsc --noEmit across all workspaces
 ```
 
-**105 tests across 7 files** — 94 backend, 11 web. The target is proof that the hard paths work, not a coverage number, so the suite is concentrated on the failures most likely to break in real use and least likely to be tested:
+**118 tests across 10 files** — 107 backend, 11 web. The target is proof that the hard paths work, not a coverage number, so the suite is concentrated on the failures most likely to break in real use and least likely to be tested:
 
 - `requireAuth` maps missing / expired / bad-signature / wrong-algorithm tokens to four **distinct** codes, and rejects an `alg: none` token.
 - The Gemini adapter's **no-content** path surfaces as `LLM_NO_CONTENT` or `LLM_CONTENT_BLOCKED` and *never* as an empty-string success.
@@ -242,6 +243,8 @@ bun run check-types     # tsc --noEmit across all workspaces
 - No provider message ever reaches the client-facing text.
 - `/api/query` rejects an oversized prompt **before** calling the provider — asserted by the provider never being invoked.
 - An oversized body, which body-parser rejects before application code runs, still comes back as the envelope rather than Express's HTML error page.
+- An unhandled rejection is **logged, drained and exited deliberately** instead of killing the process silently — asserted by running the real entrypoint as a subprocess and reading its exit code and log lines. A companion test asserts the premise: with no handler installed, Bun kills the process in the same tick.
+- `/ready` answers 503 on a **fresh socket** while draining, with `/health` still 200 — out of process, because the in-process version of that test passes even when the listener has already closed and no poller could ever read the 503.
 - Model output is rendered as **text**: `<img src=x onerror=…>` returns through the real response path and ends up as visible text with no element created, plus a structural check that no `dangerouslySetInnerHTML` or `innerHTML =` exists anywhere in `apps/web/src`.
 
 That last one passes today for free because React escapes by default — which is exactly why it is worth having. The regression is one `dangerouslySetInnerHTML` added by someone wanting to render markdown, and nothing else in the suite would notice. Model output is untrusted data; treating it as markup is a prompt-injection sink.
@@ -293,6 +296,10 @@ The pin deserves an honest footnote: the usual justification is preventing `alg:
 
 **Login spends a bcrypt compare even when the email is unknown.** Short-circuiting would make the endpoint a timing oracle for account existence — a wrong email answering in under a millisecond while a right one spends ~100 ms.
 
+**Liveness and readiness are two endpoints, not one.** `/health` answers "is this process alive" and stays 200 for the whole of a shutdown, because a failing liveness probe is an instruction to restart and that is the wrong response to a process draining correctly. `/ready` answers "should this process receive traffic" and goes 503 the moment a drain begins, which is what the load balancer's target group checks. The process then keeps accepting for one more second before closing the listener — separating *stop being advertised* from *stop accepting*, without which the 503 is unobservable: close the listener in the same tick and a probe gets a refused connection instead of an answer.
+
+**A fatal fault drains rather than exiting on the spot.** `unhandledRejection` and `uncaughtException` are logged through the structured logger and then run the same bounded drain as a `SIGTERM`, exiting non-zero. Exiting immediately would discard exactly the in-flight requests the drain exists to protect, so a fault in one request would kill the others — and under Bun the unhandled default is death in the same tick with no log line at all.
+
 **Prompts are never logged, but their length is.** Prompt text is user content and potentially PII. Character counts, token usage, duration, model and finish reason are what actually help diagnose a problem. The logger also redacts known-sensitive keys as a backstop — though only for string values, after live traffic showed `/token/i` matching `promptTokens` and redacting the cost data the logging exists to provide.
 
 **Rejected alternatives**, for the record: a hardcoded static token (allowed and faster, but gives up depth on an axis the brief names); Postgres-backed users (`DATABASE_URL` and `SALT_ROUNDS` were already in the env schema implying a user table — but a DB plus migrations plus a compose file is a large fraction of the budget for zero marks against any stated requirement); `Bun.serve` with HTML imports (no bundler, but unconventional for a reviewer); and SSE streaming (see below).
@@ -315,7 +322,13 @@ Each of these is a conscious omission rather than an oversight, and would be the
 
 **Client disconnects do not cancel the upstream call.** The `LlmProvider` seam accepts an `AbortSignal` and the adapter honours it — this is unit-tested — but under Bun's `node:http` compatibility layer there is no server-side signal that reliably fires on a POST disconnect. Measured: `req` emits `close` when the *body* is consumed, whether or not the client is still there, and on an actual disconnect `res` emits nothing at all. So the conventional `res.on('close')` wiring fires exactly when it is not needed and stays silent when it is; shipping it would have *looked* like working cancellation while doing nothing, which is worse than its absence because it would be believed. It arrives free by running on Node, or by serving with `Bun.serve`, whose `Request.signal` aborts on disconnect. The adapter's own `LLM_TIMEOUT_MS` deadline still bounds every call, so a hung provider cannot pin a request open.
 
+**No circuit breaker on the provider.** This is the largest remaining gap and the next thing worth building. When the provider browns out — not hypothetical: `gemini-flash-latest` and `gemini-2.5-flash` both returned 503 "high demand" during this build, and one call took 37.6 s — every request still occupies a slot for the full 20 s deadline, and the adapter's one retry doubles outbound load against a service that is already failing. The fix composes onto the existing `LlmProvider` seam as a decorator rather than touching the adapter or the route: open after N consecutive failures, fail fast with `LLM_UNAVAILABLE` and a `Retry-After`, half-open on a single probe, and report the open circuit through `/ready`. Fully testable through the fake provider, with no network and no new dependency. Planned as §18 item 2 in the implementation plan.
+
+**The client never reads `Retry-After`.** The server sets it on both rate-limit codes and CORS exposes it, but `ErrorNotice` offers a retry button the user can press immediately regardless — so the API politely asks for a pause that nothing enforces. Reading the header and disabling the affordance until it elapses is ~40 lines against contract machinery that already exists.
+
 **Observability is structured logs only.** No tracing, no metrics backend. `DEPLOYMENT.md` specifies the CloudWatch alarms that would be the first addition.
+
+**No CI.** Every gate in the implementation plan was run by hand. One workflow running `check-types`, `test`, `lint` and `docker build` would make them continuously re-provable; `scripts/smoke-llm.ts` already distinguishes a typed failure (exit 1) from an unmapped throw (exit 2) specifically so it can serve as a deploy gate.
 
 **`lint` cannot fail.** `eslint-plugin-only-warn`, inherited from the Turborepo starter this repo was scaffolded from, downgrades every rule to a warning, so `turbo run lint` exits 0 regardless of findings. Fine as a developer-experience default, useless as a CI gate — removing the plugin from `packages/eslint-config/base.js` is a one-line change, and `DEPLOYMENT.md` flags it as a prerequisite before the pipeline is trusted.
 

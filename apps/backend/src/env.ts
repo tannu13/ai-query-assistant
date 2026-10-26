@@ -32,6 +32,38 @@ const EnvSchema = z.object({
    */
   SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(8_000),
 
+  /**
+   * How long the process keeps accepting connections AFTER readiness has gone
+   * red, before it stops listening.
+   *
+   * This exists because the obvious implementation does not work, and the
+   * failure is invisible from the code. `/ready` flips to 503 on the first
+   * line of the drain — but if `server.close()` runs in the same tick, the
+   * listener is already gone by the time any poller can ask, so a fresh probe
+   * gets a refused connection and an idle keep-alive one gets closed by
+   * `closeIdleConnections()`. The 503 is then unobservable in practice, and a
+   * readiness endpoint nobody can read during a drain is decoration.
+   *
+   * Separating the two concerns fixes it: "stop being advertised" happens
+   * immediately, "stop accepting" happens once a poller has had a chance to
+   * notice. That window is this value.
+   *
+   * The budget nests, and the order matters:
+   *
+   *     READINESS_DRAIN_MS  <  SHUTDOWN_TIMEOUT_MS  <  orchestrator stopTimeout
+   *
+   * The first inequality is enforced below. The second cannot be checked from
+   * here and is documented in DEPLOYMENT.md.
+   *
+   * One second by default. It is unnecessary on the ECS deployment in
+   * DEPLOYMENT.md, where the target is deregistered *before* SIGTERM arrives
+   * — but it is the whole mechanism on Kubernetes, where the readiness probe
+   * is how a pod leaves rotation and SIGTERM arrives before kube-proxy has
+   * finished withdrawing the endpoint. A second per task on a rolling deploy
+   * is a small price for a signal that is truthful on both.
+   */
+  READINESS_DRAIN_MS: z.coerce.number().int().nonnegative().default(1_000),
+
   /** bcrypt cost factor, used when hashing and comparing the demo password. */
   SALT_ROUNDS: z.coerce.number().positive().default(10),
 
@@ -152,6 +184,14 @@ const EnvSchema = z.object({
  * request that happens to exercise it.
  */
 const ValidatedEnvSchema = EnvSchema.superRefine((value, ctx) => {
+  if (value.READINESS_DRAIN_MS >= value.SHUTDOWN_TIMEOUT_MS) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['READINESS_DRAIN_MS'],
+      message: `READINESS_DRAIN_MS (${value.READINESS_DRAIN_MS}) must be below SHUTDOWN_TIMEOUT_MS (${value.SHUTDOWN_TIMEOUT_MS}) — otherwise the process spends its whole drain budget advertising unreadiness and never finishes the requests it is draining`,
+    });
+  }
+
   if (value.LLM_PROVIDER === 'fake' && value.APP_STAGE === 'prod') {
     ctx.addIssue({
       code: 'custom',

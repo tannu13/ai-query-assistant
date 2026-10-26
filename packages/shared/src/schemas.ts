@@ -28,6 +28,31 @@ export const healthResponseSchema = z.object({
 });
 export type HealthResponse = z.infer<typeof healthResponseSchema>;
 
+/**
+ * Readiness, which is a different question to liveness and deliberately a
+ * different endpoint.
+ *
+ * `/health` answers "is this process alive", and a drain must NOT fail it —
+ * an orchestrator watching liveness is entitled to SIGKILL a process whose
+ * probe goes red, which is precisely the wrong response to one that is
+ * shutting down correctly. `/ready` answers "should this process receive
+ * traffic", which goes false the moment a drain begins, and is what lets the
+ * app participate in its own rollout rather than relying on the load
+ * balancer having been configured to deregister first.
+ *
+ * `draining` is paired with HTTP 503 on the wire. That status is the payload
+ * as far as a probe is concerned — probes read status codes, not bodies — so
+ * this is a state report rather than an error, and deliberately not the §9
+ * error envelope: the `ErrorCode` union exists so the web app can map a code
+ * to something a user should do, and no user ever sees this response.
+ */
+export const readinessResponseSchema = z.object({
+  status: z.enum(['ready', 'draining']),
+  uptimeSeconds: z.number().nonnegative(),
+  stage: z.enum(['dev', 'prod']),
+});
+export type ReadinessResponse = z.infer<typeof readinessResponseSchema>;
+
 export const loginRequestSchema = z.object({
   email: z.email('Enter a valid email address'),
   password: z.string().min(1, 'Password is required'),

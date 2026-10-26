@@ -54,15 +54,27 @@ The build is already root-context (see [`apps/backend/Dockerfile`](apps/backend/
 | `stopTimeout` | 30 s | Longer than `SHUTDOWN_TIMEOUT_MS` (8 s), so the app always wins the race and exits on its own terms |
 | Platform | ARM64 (Graviton) | ~20% cheaper for the same work; `oven/bun` publishes arm64 and the image has no x86-only native dependency — `bcrypt` ships an arm64 musl prebuild |
 
-**Target group health check** → `GET /health`, 200 expected. That endpoint is unauthenticated and does **not** call the LLM provider, which is the point: a health check that spent a token per probe would make liveness a recurring cost, and a provider outage would fail every task's health check and turn a degraded dependency into a cluster-wide restart loop. Liveness and dependency health are different questions, and the ALB is only entitled to the first.
+**Target group health check** → `GET /ready`, 200 expected. Neither endpoint is authenticated and neither calls the LLM provider, which is the point: a health check that spent a token per probe would make liveness a recurring cost, and a provider outage would fail every task's health check and turn a degraded dependency into a cluster-wide restart loop. Liveness and dependency health are different questions, and the ALB is only entitled to the first.
+
+**`/ready` rather than `/health`, and the distinction is load-bearing.** The two endpoints answer different questions, and an ALB target group health check decides *whether a target receives traffic* — which is readiness. `/health` is liveness and stays 200 throughout a drain on purpose, because a liveness probe going red is an instruction to restart and that is the wrong response to a process shutting down correctly. The container's own `HEALTHCHECK` stays on `/health` for exactly the symmetrical reason: Docker uses it to decide whether to replace the container, not whether to route to it.
 
 **Deregistration delay** → 35 s on the target group, just over `stopTimeout`. The ordering that matters during a rolling deploy:
 
 1. ECS deregisters the task from the target group; the ALB stops sending it new requests.
-2. ECS sends `SIGTERM`. The app stops accepting connections, drains in-flight requests, closes idle keep-alive sockets, and exits 0 — see [`apps/backend/src/index.ts`](apps/backend/src/index.ts).
+2. ECS sends `SIGTERM`. The app flips `/ready` to 503 immediately, keeps accepting for `READINESS_DRAIN_MS` (1 s) so anything still polling readiness sees that, then stops accepting connections, drains in-flight requests, closes idle keep-alive sockets, and exits 0 — see [`apps/backend/src/index.ts`](apps/backend/src/index.ts).
 3. Only if that takes longer than `stopTimeout` does ECS resort to `SIGKILL`.
 
-Get this wrong and every deploy drops live requests, which is not academic here: a single query may legitimately run for `LLM_TIMEOUT_MS` (20 s by default), so the window in which a task is holding real user work is wide. `SHUTDOWN_TIMEOUT_MS` must stay **below** `stopTimeout` or it has no effect at all.
+Get this wrong and every deploy drops live requests, which is not academic here: a single query may legitimately run for `LLM_TIMEOUT_MS` (20 s by default), so the window in which a task is holding real user work is wide.
+
+The budgets nest, and each inequality earns its place:
+
+```
+READINESS_DRAIN_MS (1s)  <  SHUTDOWN_TIMEOUT_MS (8s)  <  stopTimeout (30s)
+```
+
+The first is enforced at boot by the env schema — a readiness window at or above the drain budget would spend the whole budget advertising unreadiness and never finish the requests it is draining. The second cannot be checked from inside the process and is this document's responsibility: `SHUTDOWN_TIMEOUT_MS` must stay below `stopTimeout` or it has no effect at all, because the orchestrator would `SIGKILL` first.
+
+**On ECS specifically, `READINESS_DRAIN_MS` is redundant**, because step 1 above already removed the task from rotation before `SIGTERM` arrived. It is kept non-zero anyway: on Kubernetes the readiness probe *is* how a pod leaves rotation, `SIGTERM` arrives before kube-proxy has finished withdrawing the endpoint, and without the window the 503 is unobservable — the listener closes in the same tick, so a probe gets a refused connection rather than an answer. One second per task on a rolling deploy buys a readiness signal that is truthful on either orchestrator. Set it to `0` to opt out.
 
 **Circuit breaker with rollback** enabled on the service, so a task that cannot pass its health check — the shape a bad `JWT_SECRET` takes, since the env schema exits non-zero at boot — rolls back automatically instead of draining the healthy tasks into a crash loop.
 
@@ -112,7 +124,7 @@ Consequences worth stating:
 
 - **Two roles, not one.** The *execution* role is what pulls from ECR and reads these two secret ARNs — `secretsmanager:GetSecretValue` scoped to exactly those ARNs, not `*`. The *task* role is what application code gets, and it needs **no** AWS permissions at all, because the app talks only to Google. Collapsing them into one role is the common shortcut and it hands application code the ability to read its own secrets, which is precisely the capability an RCE wants.
 - **Rotation is a task replacement**, not a live reload: the env schema reads configuration once at boot. Rotating means writing the new version and forcing a new deployment. That is a real limitation, honestly cheaper here than a secrets-caching client, and worth saying out loud rather than implying the key refreshes itself.
-- **Non-secret config stays in `environment`** — `APP_STAGE=prod`, `GEMINI_MODEL`, `LLM_TIMEOUT_MS`, `CORS_ORIGINS`, `SHUTDOWN_TIMEOUT_MS`. Routing everything through Secrets Manager would make the mechanism meaningless by making it ordinary.
+- **Non-secret config stays in `environment`** — `APP_STAGE=prod`, `GEMINI_MODEL`, `LLM_TIMEOUT_MS`, `CORS_ORIGINS`, `SHUTDOWN_TIMEOUT_MS`, `READINESS_DRAIN_MS`. Routing everything through Secrets Manager would make the mechanism meaningless by making it ordinary.
 - **`DEMO_USER_PASSWORD_HASH_B64` is base64 for a reason that pays off here.** It is byte-identical through Bun's dotenv loader, Docker's `--env-file`, and an injected secret — the last of which does no parsing at all. See the comment on it in [`apps/backend/src/env.ts`](apps/backend/src/env.ts).
 
 **Nothing secret exists in the image.** Verified rather than asserted: the built image was exported with `docker save`, every layer decompressed, and the live key, signing secret and password hash searched for as bytes — 0 hits, against a positive control that proved the scan was reading real content. `.dockerignore` excludes `**/.env` and `**/.env.*` at every depth, and the Dockerfile copies named paths instead of `COPY . .`, so a credential has to defeat two independent controls to reach a layer.

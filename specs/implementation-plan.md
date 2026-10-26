@@ -1,7 +1,7 @@
 # AI Query Assistant — Implementation Plan
 
 **Assignment:** Husqvarna Group / GIS India — Take-Home Engineering Exercise, Senior Full Stack Engineer (Cloud & AI Applications)
-**Status:** **All phases 0–8 complete** on branch `feat/ai-query-assistant`. Backend, frontend, container and documentation are all done, each behind a gate that was run rather than reasoned about. The real provider round-trip that closed Phase 4 gate 1 has since been re-confirmed from inside the container (Phase 7 check 3) and from a clean clone (Phase 8 check 1).
+**Status:** **All phases 0–9 complete** on branch `feat/ai-query-assistant`. Phases 0–8 delivered the brief; **Phase 9 (§18) is resilience work beyond it** — a crash net under every promise and a readiness signal separate from liveness. Backend, frontend, container and documentation are all done, each behind a gate that was run rather than reasoned about. The real provider round-trip that closed Phase 4 gate 1 has since been re-confirmed from inside the container (Phase 7 check 3) and from a clean clone (Phase 8 check 1).
 **Budget:** ~3–4 hours, per the brief.
 
 ---
@@ -319,6 +319,7 @@ Correspondingly, `errorHandler` is the only place that converts an exception to 
 | `NODE_ENV` | runtime mode | existing |
 | `APP_STAGE` | dev / prod | existing |
 | `SHUTDOWN_TIMEOUT_MS` | drain budget on SIGTERM | default 8000 — **added in Phase 7**, deliberately under Docker's 10s grace |
+| `READINESS_DRAIN_MS` | window between `/ready` going 503 and the listener closing | default 1000 — **added in Phase 9**; must stay below `SHUTDOWN_TIMEOUT_MS`, enforced at boot |
 | `JWT_SECRET` | HS256 signing key | min 32 chars, already enforced |
 | `JWT_ISSUER` / `JWT_AUDIENCE` | asserted on verify | new |
 | `JWT_EXPIRES_IN` | token lifetime | default `15m` |
@@ -1191,6 +1192,206 @@ One caveat the list earns the right to state: item 1 was resolved by *reading* t
 3. ~~**The SDK's native `p-retry` behaviour**~~ — **resolved in Phase 4.** Retry is OFF unless `retryOptions` is passed. Opted in with 2 attempts / 0.5s initial delay, 429 excluded.
 4. ~~**Whether `response.text` is a property or a method**~~ — **resolved in Phase 4.** A getter: `get text(): string | undefined`. The `| undefined` is the failure mode §8 is built around.
 5. ~~**`express.json({ limit })` interaction with the prompt cap**~~ — **resolved in Phase 2.** An oversized body is rejected by body-parser as an `http-errors` instance with `type: 'entity.too.large'` before application code runs, so the prompt cap is never consulted and the default handler would answer with HTML. `errorHandler` maps all seven body-parser `type` values to `VALIDATION_FAILED`; covered by two tests.
+
+---
+
+## 18. Resilience backlog — what breaks under conditions the build never saw
+
+Phases 0–8 delivered the brief, and every gate was run rather than reasoned about. But every one of those gates ran against a **healthy** system: a provider that answered, a process that stayed up, a deploy nobody was mid-request through. This section is the other half — failure modes reachable in ordinary operation that are currently survived by luck rather than by design.
+
+Ordered by (likelihood × blast radius) ÷ cost, which is deliberately not the same as ordered by interest. Items 1 and 3 are cheap and close total-loss failures; item 2 is the most valuable and by far the most work.
+
+### Measured first
+
+Four claims this section rests on, checked against the installed runtime rather than assumed. Two of them changed the list.
+
+| # | Check | Result |
+| --- | --- | --- |
+| M1 | Unhandled rejection, no handler installed | **Process dies immediately.** A `setTimeout` scheduled 300 ms out never fires; nothing is logged in this app's format. |
+| M2 | The same, with `process.on('unhandledRejection')` installed | Suppressed. The handler runs, the process survives, and the exit becomes ours to choose. Identical for `uncaughtException` thrown from a timer callback. |
+| M3 | `node:http` server timeout defaults under Bun 1.3.13 | `requestTimeout` 300 000 ms, `headersTimeout` 60 000 ms, `keepAliveTimeout` 5 000 ms — Node-like, and already set. |
+| M4 | 40 `process.stderr.write` lines followed by an immediate `process.exit(1)`, stderr on a pipe | **40/40 survive.** A crash handler may log and exit in the same tick with no async flush. |
+
+M3 removed "no HTTP server timeouts" from this list: the defaults are sane, so a slow-body attack is not wide open, and tightening `requestTimeout` toward the LLM deadline is a two-line refinement rather than a gap. M4 settled *how* item 1's handler must be written — had piped writes been lossy, the handler would have needed a flush-then-exit dance, and the log line is the entire value of the handler.
+
+### 1. One unhandled rejection kills the process and bypasses this repo's own drain logic
+
+**Priority: highest. Cost: ~20 lines plus tests.**
+
+There is no `unhandledRejection` or `uncaughtException` handler anywhere in `apps/backend`. Per M1 the process then dies in the same tick, which means:
+
+- every in-flight request is severed — up to `LLM_TIMEOUT_MS` (20 s) of work each, for callers who did nothing wrong;
+- nothing is written in this application's structured format, so the one failure most in need of a correlation id produces none;
+- `src/index.ts`'s graceful shutdown — which exists *specifically* to stop a signal severing in-flight queries — is skipped entirely. A crash is the one exit path it does not cover.
+
+This hazard is already documented in this repo, one promise wide. `services/llm/gemini.ts` carries `call.catch(() => undefined)` with the comment *"a provider that rejects after the deadline has already won produces an unhandled rejection, which under Bun takes the process down — turning a handled timeout into a crash."* That reasoning is correct and its remedy is local. There is no net behind it, so the next missed promise — in a dependency, in a future route — reproduces the same crash with no comment to warn about it.
+
+**The graceful answer:** handlers in `index.ts` that log through `logger` (synchronous, and M4 proves the line survives), then run the existing bounded drain and exit non-zero.
+
+Two judgment calls worth recording rather than discovering later:
+
+- **Log-and-exit, never log-and-continue.** A process that has thrown past every `catch` is in a state nobody has reasoned about. Continuing to serve from it trades a loud restart for a quiet corruption, and only one of those is debuggable.
+- **Drain rather than `process.exit(1)` immediately.** Exiting at once discards exactly the in-flight requests the drain exists to protect, so a fault in one request would kill N others — the blast radius this item is trying to shrink. Reusing `shutdown()` is safe *because* it is already bounded: its `SHUTDOWN_TIMEOUT_MS` deadline force-exits, so a wedged process cannot hang on the way out, and its `shuttingDown` guard makes a second fault during the drain a force-exit rather than a recursive loop. The residual risk — a suspect process answering a few more in-flight requests — is bounded by the drain budget and is the cheaper of the two mistakes. **Item 3 is what makes it defensible**, because readiness flips immediately and no *new* request is routed to the faulty process.
+
+### 2. No failure isolation on the upstream — no circuit breaker, no concurrency cap
+
+**Priority: high. Cost: ~100 lines plus tests. The most valuable of the five.**
+
+The provider failing is not hypothetical here: this build measured `gemini-flash-latest` *and* `gemini-2.5-flash` both returning 503 "high demand" on 2026-10-26, and a single call at 37 598 ms. When the provider browns out today:
+
+- every request occupies a slot for the full `LLM_TIMEOUT_MS`, so latency degrades for everyone instead of failing fast for some;
+- `retryOptions.attempts: 2` sends **2× outbound load** to a service that is already failing. §8 reasoned exactly this way to exclude 429 — *"retrying a rate limit inside the request burns the caller's deadline and adds load to the thing that just asked for less"* — and the same argument applies to a 503, where it was not applied;
+- nothing bounds concurrent in-flight provider calls, so queue depth is unbounded and the only backstop is a rate limiter whose budget is per JWT subject, of which there is currently exactly one.
+
+**The graceful answer:** a breaker as a **decorator over the existing `LlmProvider` interface** — `withCircuitBreaker(provider)`. N consecutive `LLM_TIMEOUT` / `LLM_UNAVAILABLE` failures open the circuit for T seconds; while open, calls fail fast with `LLM_UNAVAILABLE` and a `Retry-After`; a single probe half-opens it. Alongside it, a semaphore that sheds load rather than queueing it.
+
+Two reasons this is the strongest item despite not being first: it needs no new dependency and no network, because `fake.ts` already reaches every failure in the matrix by prompt prefix (`!unavailable`, `!timeout`, `!hang`); and it is the payoff on the seam itself. §8 justified `LlmProvider` as the answer to "how would you swap the provider?". Composing resilience onto it without touching the adapter or the route is the stronger answer, and it is the one that makes the interface load-bearing twice.
+
+### 3. `/health` reports 200 while the process is draining, and there is no readiness signal
+
+**Priority: high. Cost: ~30 lines. Belongs with item 1.**
+
+`routes/health.ts` has no knowledge of shutdown state — the `shuttingDown` flag is a module-local in `index.ts` — so after SIGTERM the endpoint keeps answering `{"status":"ok"}` while `server.close()` is already refusing new connections. A load balancer using it as a readiness gate therefore keeps routing to a socket that will reset.
+
+`DEPLOYMENT.md` mitigates this on ECS by documenting deregistration *before* SIGTERM, and that ordering is correct. But it is the orchestrator's politeness, not the application's correctness: on Kubernetes the readiness probe **is** the drain mechanism, and an app that cannot say "stop sending me traffic" has no way to participate in its own rollout.
+
+There is also no way to express a third state that item 2 introduces: a process that is alive and draining nothing, but cannot currently serve a query because the upstream circuit is open.
+
+**The graceful answer:** split liveness from readiness.
+
+- `/health` stays exactly as it is — liveness, always 200 while the event loop turns. A probe that fails during a deliberate drain invites the orchestrator to SIGKILL a process that is shutting down correctly.
+- `/ready` answers 200 while accepting traffic and 503 while draining, and is the natural home for the breaker's state when item 2 lands.
+
+The existing decision *not* to call the provider from a health check stands, and item 2 strengthens it: a breaker already holds a continuously-updated opinion about upstream health, assembled from real traffic. Reading that is strictly better than spending a token per probe to learn the same thing — the probe measures one synthetic call, the breaker measures every real one.
+
+### 4. The `Retry-After` loop is open at both ends
+
+**Priority: medium. Cost: ~40 lines in `apps/web` plus a test. The most visible in a live demo.**
+
+`server.ts` exposes `Retry-After` through CORS `exposedHeaders`, and both `RateLimitedError` and `LlmRateLimitedError` set it. **Nothing in `apps/web` reads it.** So the server says "come back in 30 seconds" and `ErrorNotice` offers a button the user can press immediately and repeatedly — against an upstream that just asked for less load. Server-side, a brownout means every client retrying in lockstep with no jitter.
+
+**The graceful answer:** read the header in `errorFromResponse`, carry it on `ApiError`, and have `ErrorNotice` disable the retry affordance until it elapses with a visible countdown. One automatic retry with jitter for `LLM_TIMEOUT` only. The contract machinery — `RETRYABLE_ERROR_CODES`, `isRetryableErrorCode` — is already built and already drives which errors offer a retry at all; this closes the circuit rather than opening a new one.
+
+### 5. No CI, and `lint` still cannot fail
+
+**Priority: medium. Cost: ~40 lines of YAML plus a one-line ESLint change.**
+
+There is no `.github/` directory. 94 passing tests, a Dockerfile proven non-root and drainable, and nine hand-run phase gates — none of it re-provable on push. Paired with `eslint-plugin-only-warn` (honestly documented in the README and the Review notes, still unfixed), the repository's quality bar currently lives in one shell history.
+
+**The graceful answer:** one workflow running `check-types`, `test`, `lint` and `docker build`. `scripts/smoke-llm.ts` already distinguishes exit 1 (a typed `AppError` — the adapter worked) from exit 2 (an unmapped throw — it did not) *specifically* so it can serve as a deployment smoke gate; wiring it as one is what makes that distinction pay.
+
+### Declined, with reasons
+
+- **HTTP server timeouts** — see M3. Bun's defaults are Node-like and already set. Tightening `requestTimeout` toward `LLM_TIMEOUT_MS` is a defensible two-line change; it is not a gap, and listing it as one would pad the list.
+- **The rate limiter's unbounded `Map`** — `sweep()` evicts only buckets that have refilled to capacity, so partially-drained keys accumulate past `SWEEP_THRESHOLD`. Reachable through the IP-keyed login limiter, since IPs are attacker-controlled. Not the binding constraint: each attempt also costs a ~100 ms bcrypt, so the event loop saturates long before ~25 M buckets matter. The concurrency cap in item 2 is the same mechanism applied where it binds first.
+- **Streaming, Redis-backed limiting, persistence** — already recorded in §14 and the README. Each is a feature; none is resilience, and relabelling them as resilience would be the kind of scope inflation §14 exists to prevent.
+
+---
+
+### Phase 9 — Crash net and readiness · ~45m
+
+Items 1 and 3 together, because they share `index.ts` and because each is what makes the other defensible: the crash handler drains rather than exiting instantly, which is only safe if readiness has already told the load balancer to stop sending work.
+
+**Goal:** no single unhandled rejection can take the process down silently, and the process can state whether it should receive traffic.
+
+**Deliverables:** `src/lib/lifecycle.ts` (shutdown state readable by both the signal handler and the route) · `unhandledRejection` / `uncaughtException` handlers in `src/index.ts` · `/ready` in `src/routes/health.ts` · `readinessResponseSchema` in `@repo/shared` · tests for both.
+
+**Gate:**
+
+```sh
+# 1. Readiness flips on SIGTERM; liveness does not.
+#    → /ready 200 {"status":"ready"} before, 503 {"status":"draining"} after,
+#      while /health stays 200 throughout the drain.
+
+# 2. An unhandled rejection is survivable and logged, not silent.
+#    → one structured `level:"error"` line naming the reason, then a normal
+#      drain and a non-zero exit — NOT an immediate death
+
+# 3. A crash during a drain force-exits instead of restarting the clock.
+
+# 4. bun test — green, including the new cases.
+```
+
+✅ Pass when readiness and liveness disagree during a drain, a provoked unhandled rejection produces a structured log line and a deliberate non-zero exit, and the suite is green.
+
+**Deliberately not working yet:** `/ready` reports only drain state. Upstream health is item 2's to contribute, and a readiness endpoint that *claimed* to know about the provider while only knowing about shutdown would be the same class of mistake as the client-disconnect wiring declined in §16 Phase 5 — machinery that looks like a guarantee and is not.
+
+#### ✅ Phase 9 outcome — all four checks pass, and gate 1 reshaped the implementation
+
+`bun test` green at **107 tests across 9 files**, up from 94. `turbo run check-types` clean across all five packages.
+
+**Gate 1 — readiness and liveness disagree during a drain, observed over a real socket.** Against the shipped default of `READINESS_DRAIN_MS=1000`:
+
+```
+BEFORE SIGTERM
+  /ready  → 200 {"status":"ready","uptimeSeconds":0,"stage":"dev"}
+  /health → 200 {"status":"ok","uptimeSeconds":0,"stage":"dev"}
+DURING DRAIN (150ms after SIGTERM)
+  /ready  → 503 {"status":"draining","uptimeSeconds":0,"stage":"dev"}
+  /health → 200 {"status":"ok","uptimeSeconds":0,"stage":"dev"}
+AFTER THE WINDOW
+  /ready  → UNREACHABLE (listener closed)
+EXIT CODE: 0
+```
+
+The log sequence from that run carries the detail that matters most: two `request completed` lines appear **after** `advertising unreadiness before closing the listener`. The process kept serving during the window rather than refusing, which is the entire purpose of it.
+
+**Gates 2 and 3 — a provoked fault is logged, drained and exited deliberately.** Live, outside the suite:
+
+```
+{"level":"info","message":"server listening","port":3000,…}
+{"level":"error","message":"fatal: unhandledRejection","kind":"unhandledRejection",
+ "err":{"name":"Error","message":"provoked unhandled rejection","stack":"…"}}
+{"level":"info","message":"shutdown requested","reason":"unhandledRejection","graceMs":8000}
+{"level":"info","message":"advertising unreadiness before closing the listener",…}
+{"level":"info","message":"shutdown complete","reason":"unhandledRejection","exitCode":1}
+→ exit 1
+```
+
+Compare the measured default from M1, which is the whole justification: no log line, no drain, dead in the same tick. Gate 3's force-exit branch is covered by provoking two rejections in one tick — `unhandledRejection` fires on the microtask checkpoint, so the second handler necessarily runs before `server.close()` can call back, making the branch reachable with no sleep and no race.
+
+### Findings
+
+**⚠️ Finding — the obvious readiness implementation is unobservable, and a unit test will confirm it works forever.** `/ready` was built as §18 item 3 described it: 503 the moment a drain begins. The in-process test passed. Then gate 1 tried to observe the 503 over a real socket and got `UNREACHABLE` instead.
+
+The cause is ordering, not logic. `shutdown()` called `server.close()` in the same tick as the readiness flip, so by the time any poller could ask, the listener was gone — a fresh probe is refused rather than answered 503, and an idle keep-alive one is closed from under the poller by `closeIdleConnections()`. Every assertion about the handler was true and the signal was still useless during the drain it exists for.
+
+Confirmed by running the counterfactual rather than reasoning about it, with `READINESS_DRAIN_MS=0`:
+
+```
+BEFORE SIGTERM     /ready → 200 ready
+DURING DRAIN       /ready → UNREACHABLE
+                   /health → UNREACHABLE
+```
+
+Fixed by splitting the drain into two phases: **"stop being advertised" and "stop accepting" are different events**, and collapsing them into one tick is what breaks the signal. Readiness flips immediately; the listener closes `READINESS_DRAIN_MS` later. The counterfactual above is now a committed test (`tests/drain.test.ts`), because `readiness.test.ts` passes either way — so without it, the one assertion that would catch someone removing the window as redundant does not exist.
+
+Two details worth recording:
+
+- **The window's timer is deliberately not `unref()`'d**, unlike the shutdown deadline beside it. That timer must *not* hold the event loop open, because its job is to fire only if draining stalls; this one must, because a process with nothing else pending would otherwise exit before performing the drain it is waiting to perform. Same construct, opposite requirement.
+- **`closeIdleConnections()` moved into the second phase.** During the window, idle keep-alive sockets are left open on purpose — a load balancer's probe arrives on one of them, and closing it is the same mistake as closing the listener early, one layer down.
+
+**Finding — the ALB was pointed at the wrong endpoint, and the split exposed it.** `DEPLOYMENT.md` had the target group health check on `GET /health`. An ALB target group health check decides *whether a target receives traffic*, which is readiness; `/health` is liveness and now deliberately stays 200 for the whole drain. Left as it was, the readiness endpoint would have existed while the thing routing traffic ignored it. Updated to `/ready`, with the container's own `HEALTHCHECK` staying on `/health` for the symmetrical reason: Docker uses it to decide whether to *replace* the container, not whether to route to it.
+
+### Decisions
+
+**Liveness stays 200 throughout a drain**, which is the counter-intuitive half and the reason these are two endpoints rather than one with a flag. A liveness probe going red is an instruction to restart, and a process shutting down correctly is the last thing that should be killed harder.
+
+**Readiness answers 503 rather than 200-with-a-status-field.** A probe reads the status code; an endpoint that always returns 200 and expects the poller to parse the body is one default load-balancer configuration away from silently never draining. The 503 body is therefore a state report rather than the §9 error envelope — deliberately, since the `ErrorCode` union exists so the web app can map a code to something a user should do, and no user ever sees this response.
+
+**A fatal fault drains rather than exiting immediately.** `process.exit(1)` in the handler would discard exactly the in-flight requests the drain exists to protect, so a fault in one request would kill N others — the blast radius the handler is meant to shrink. Reusing `shutdown()` is safe *because* it is already bounded: its deadline force-exits, so a wedged process cannot hang on the way out, and `beginDraining()`'s return value makes a second fault mid-drain a force-exit rather than a recursive loop. The residual risk — a suspect process answering a few more in-flight requests — is what readiness makes acceptable, and is the cheaper of the two mistakes.
+
+**`beginDraining()` returns whether the caller started the drain**, collapsing "have we already begun?" into the operation that begins it. The version with a separate boolean read first is the version with a race in it, and it is what the old `let shuttingDown` was.
+
+**Logging is wrapped in `try/catch` in exactly one place.** Everywhere else a throwing logger is a bug worth surfacing; inside an `uncaughtException` handler it is a second fault in the handler for the first, which is unrecoverable and would discard the diagnostic entirely. Cycles are already safe — the logger's `MAX_DEPTH` terminates them — so this guards a throwing getter or `toJSON`, not a structural problem.
+
+**The premise is a committed test.** `no-handler-harness.ts` asserts that Bun kills a process on an unhandled rejection with no handler installed. That is a claim about the runtime, not about this application, and it is committed for the same reason the Gemini tests use the SDK's own enums: if a future Bun changes it, the justification in `src/index.ts` has gone stale and a failing test is what sends someone to rewrite it.
+
+**The crash tests run with `READINESS_DRAIN_MS=0`.** They assert the fault path, not the window; leaving it on added a second of wall clock per case for no extra assertion. The window's own behaviour is `drain.test.ts`'s subject.
+
+### What this does not do
+
+`/ready` reports drain state and nothing else. It is now the right place for upstream health, and §18 item 2's circuit breaker is what has an opinion worth reporting — but a readiness endpoint that claimed to know about the provider while only knowing about shutdown would be the same class of mistake as the client-disconnect wiring declined in Phase 5: machinery that looks like a guarantee and is not.
 
 ---
 
