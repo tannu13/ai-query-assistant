@@ -43,6 +43,25 @@ export const loginResponseSchema = z.object({
 export type LoginResponse = z.infer<typeof loginResponseSchema>;
 
 /**
+ * Identity of the caller behind the current token.
+ *
+ * Exists so Phase 3's auth cycle is verifiable before `/api/query` exists,
+ * and kept because it is genuinely useful in the README's curl walkthrough:
+ * it is the one call that shows a token's claims without asking the reader
+ * to base64-decode anything.
+ */
+export const meResponseSchema = z.object({
+  /** Opaque subject id — deliberately not the email. */
+  sub: z.string(),
+  email: z.email(),
+  /** `exp` claim, seconds since the epoch. */
+  exp: z.number().int().positive(),
+  /** Seconds until this token expires, for convenience. */
+  expiresInSeconds: z.number().int(),
+});
+export type MeResponse = z.infer<typeof meResponseSchema>;
+
+/**
  * Contract default for the prompt cap, mirrored client-side for immediate
  * feedback. The server's own cap is configurable (LLM_MAX_PROMPT_CHARS) and is
  * the only one that is authoritative — the client-side check is a convenience,

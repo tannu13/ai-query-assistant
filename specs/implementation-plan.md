@@ -1,7 +1,7 @@
 # AI Query Assistant — Implementation Plan
 
 **Assignment:** Husqvarna Group / GIS India — Take-Home Engineering Exercise, Senior Full Stack Engineer (Cloud & AI Applications)
-**Status:** Phases 0–1 complete on branch `feat/ai-query-assistant`. Phase 2 next.
+**Status:** Phases 0–3 complete on branch `feat/ai-query-assistant`. Phase 4 next.
 **Budget:** ~3–4 hours, per the brief.
 
 ---
@@ -206,7 +206,7 @@ Visual scope is intentionally modest: plain CSS, clear typography and spacing, v
 
 **`requireAuth`** middleware on `/api/query`, with these specifics:
 
-- **Algorithm pinned** via `algorithms: ['HS256']`. Without it, `jsonwebtoken` honours the algorithm named in the token's own header — the classic `alg` confusion attack. One line; a strong 30-second debrief answer.
+- **Algorithm pinned** via `algorithms: ['HS256']`. ⚠️ **The original rationale here was wrong — corrected by measurement in the Phase 3 outcome.** `jsonwebtoken` v9 already rejects `alg: none` with or without the pin, and the dangerous asymmetric→symmetric confusion is unreachable with a symmetric secret. What the pin actually prevents is the library deriving its acceptable set from the *key type* — the whole HMAC family for a string secret — so the server accepts tokens it would never issue. Worth the line as defence against configuration drift, not as a fix for a live exploit.
 - **`issuer` and `audience` asserted** on verify, not merely set on sign. Signing claims that are never checked is decoration.
 - **Short expiry** (15m default, env-configurable).
 - **Distinct error codes** for missing, malformed, expired, and invalid-signature tokens — so the frontend can respond differently and the logs are diagnosable.
@@ -317,7 +317,7 @@ Correspondingly, `errorHandler` is the only place that converts an exception to 
 | `JWT_EXPIRES_IN` | token lifetime | default `15m` |
 | `SALT_ROUNDS` | bcrypt cost | retained, used by the hash script |
 | `DEMO_USER_EMAIL` | demo login identity | new — **added in Phase 3**, with the hash script |
-| `DEMO_USER_PASSWORD_HASH` | bcrypt hash, never a plaintext password | new — **added in Phase 3** |
+| `DEMO_USER_PASSWORD_HASH_B64` | bcrypt hash, **base64-encoded**, never a plaintext password | new — added in Phase 3. Base64 because Bun's dotenv loader expands the `$` in `$2b$10$…`; see the Phase 3 outcome |
 | `GEMINI_API_KEY` | provider credential | **new, required** |
 | `GEMINI_MODEL` | model id | default `gemini-flash-latest` |
 | `LLM_TIMEOUT_MS` | adapter timeout | default 20000 |
@@ -550,6 +550,34 @@ bun test
 
 **Scaffolding note:** these checks need *some* POST route to exist. Phase 2 adds a temporary `POST /api/echo` that validates a body and echoes it back. It is removed in Phase 5, when `/api/query` takes over as the real subject of these same checks. It is listed here explicitly so it does not survive to submission by accident.
 
+#### ✅ Outcome — complete
+
+All four gates pass, plus `bun test` green at **20 tests across 3 files**. `/api/nope` returns `NOT_FOUND` in the envelope with a `X-Request-Id` header matching the body's `requestId`; a 5,000,014-byte body returns `400 VALIDATION_FAILED` as JSON; 40 requests against a capacity-20 bucket produce exactly 20 × `200` then `429` with `Retry-After: 3`; and the request id from an error body resolves to two log lines (`request rejected` at `warn`, `request completed` at `info`).
+
+**§17 item 5 — answered.** `express.json({ limit })` rejects an oversized body *before* any application code runs, as an `http-errors` instance carrying `type: 'entity.too.large'` — never as a `ZodError`, so the prompt cap is never consulted. Express's default handler answers those with an HTML page, which was the one hole through which a non-envelope error response could escape. `errorHandler` therefore maps the seven `type` discriminants body-parser can raise (`entity.too.large`, `entity.parse.failed`, `entity.verify.failed`, `encoding.unsupported`, `charset.unsupported`, `request.aborted`, `request.size.did.not.match`) onto `VALIDATION_FAILED`. Verified by curl *and* by two assertions in `tests/errorHandler.test.ts`, since this is a default-behaviour regression that a refactor could silently reintroduce.
+
+**Decision — the transport limit is derived from the domain limit.** `express.json`'s 100 kb default would buffer a body 25× the prompt cap before zod rejected it. The prompt cap counts characters and a JSON body counts bytes, and a UTF-8 character is at most four bytes, so `LLM_MAX_PROMPT_CHARS * 4 + 1024` is the tightest limit that cannot reject a legal prompt. Stating the reasoning matters more than the number: a hardcoded `'20kb'` would drift silently the moment the cap changed.
+
+**Decision — the code → status table is exhaustive by construction.** `HTTP_STATUS_BY_ERROR_CODE` is declared `as const satisfies Record<ErrorCode, number>`, so adding a code to the shared union without giving it a status is a compile error rather than a 500 found in production. This is the second place the shared package is load-bearing rather than decorative.
+
+**Decision — `express.urlencoded` removed.** Nothing in this API accepts a form body, and a JSON endpoint that also accepts `application/x-www-form-urlencoded` is reachable from a cross-origin HTML form *without* a preflight — so the CORS allowlist, which is the actual control, would not be consulted. One deleted line, one fewer bypass.
+
+**Decision — the inbound `X-Request-Id` is not adopted.** A client-supplied id lands verbatim in the logs, which is a log-injection vector; honouring it would need a format allowlist first. The id is always generated server-side. Noted in `requestId.ts` that the right production move is to adopt the infrastructure's trace header (`X-Amzn-Trace-Id`), which is not attacker-controlled.
+
+**Decision — the rate limiter is a factory, not a singleton, and sweeps inline.** A factory lets each route set its own budget and each test start from an empty bucket. The sweep matters more: a `Map` keyed on client-controlled input is a slow memory-exhaustion vector, so buckets that have refilled to capacity are dropped once the map exceeds 10,000 keys — a full bucket is indistinguishable from one that never existed, so forgetting it changes no decision. Swept inline rather than on a `setInterval`, which would hold the event loop open and leak a timer into every test. `req.ip` reflects the socket peer, so a deployment behind the ALB in §12 must set `trust proxy` or every client shares one bucket; trusting `X-Forwarded-For` unconditionally is the opposite mistake, since the header is forgeable.
+
+**Finding — the test suite needed its own environment, or it would not run on a clean clone.** `src/env.ts` exits non-zero without `JWT_SECRET` and `GEMINI_API_KEY`, so `bun test` depended on a developer's local, gitignored `.env` — meaning the README's "run the tests" step would fail for a reviewer. Added a committed `apps/backend/.env.test`, which Bun loads when `NODE_ENV=test` (`bun test` sets it) *after* `.env`, so its placeholders win. Verified by probe: under `bun test` the suite sees `SALT_ROUNDS=4` and the placeholder key, not the local values. Safe to commit because every value in it is a placeholder, and it lowers the bcrypt cost from 10 to 4 — the right number in production, the wrong one multiplied across a suite.
+
+**Finding — the logger is silent under test, and redaction is tested directly instead.** The suite's job is to provoke the failures the logger exists to record, so a run logged 42 kB of expected stack traces over thirteen assertions. `MIN_LEVEL` is now `silent` when `NODE_ENV=test`. Since that makes stdout capture useless, the pure redaction function is exported and unit-tested directly: nested secrets, prompt truncation, the `Error` + `cause` chain that `JSON.stringify` renders as `{}`, and cyclic/BigInt/function values that must not make the logger throw while reporting a failure. A security claim that exists only as a comment is not a guarantee.
+
+**Finding — `NODE_ENV` was an undeclared turbo input.** `turbo/no-undeclared-env-vars` flagged `logger.ts` reading `process.env.NODE_ENV` directly (it must, since the logger needs a level before the zod schema has validated anything). Added `globalEnv: ["NODE_ENV"]`, so turbo no longer serves a cached result across a mode change, and registered a `test` task with `.env*` in its inputs.
+
+**Tests are run through a real socket on port 0.** The app is exported separately from `listen()`, and the test helper binds an OS-assigned loopback port — so the suite never collides with a dev server on `APP_PORT` or with a parallel file. Going through HTTP rather than calling handlers directly is the point: `express.json` rejecting an oversized body and Express's HTML fallback for an unmatched route both live in the transport layer and are invisible to a handler-level double.
+
+**Beyond the planned gate.** The most valuable assertion in `errorHandler.test.ts` is not in §16: a route throws an error whose message contains a fake internal endpoint and a fake credential, and the test asserts the *entire serialised response* — not just `message` — contains neither. That is the §9 rule ("upstream provider errors never reach the client verbatim") as an executable check rather than a convention, and it is what will catch a future handler that helpfully forwards `error.message`.
+
+**Finding — the leak-canary fixtures had to stop looking like real keys.** The first version used `AIzaFAKEKEY…`, which made Phase 0's gate 3 (`git grep -E "AIza[0-9A-Za-z_-]{10,}"`) match tracked content from then on. A secret scan with a permanent known-good match is a scan everyone learns to ignore, which costs more than the fixture's realism was worth. The canaries are now `CANARY-NOT-A-REAL-CREDENTIAL` and `internal.provider.invalid` (a reserved TLD), and gate 3 is clean again. The assertion needs a *distinctive* string, not a plausible one.
+
 ---
 
 ### Phase 3 — Authentication · ~25m
@@ -589,6 +617,51 @@ bun test    # includes the alg-confusion case
 **Deliberately not working yet:** no LLM, no frontend. `/api/me` is the only protected route.
 
 **Why `/api/me` exists:** Phase 3 must be verifiable before `/api/query` exists, so it needs a protected route of its own. `/api/me` is five lines, is genuinely useful in the README's curl walkthrough, and — unlike the Phase 2 echo route — is worth keeping. The alternative, deferring all auth verification to Phase 5, would merge two gates into one and make a failure ambiguous between the auth and LLM layers.
+
+#### ✅ Outcome — complete
+
+All four gates pass; `bun test` green at **37 tests across 4 files**, 17 of them in `requireAuth.test.ts`. Login mints `{"token":"eyJ…","tokenType":"Bearer","expiresIn":900}`; the decoded payload carries `sub=demo-user`, `iss=ai-query-assistant`, `aud=ai-query-assistant-web`, `email`, and a 900-second `exp - iat`; and the protected route returns a **distinct code for each of six causes** — missing header, non-Bearer scheme, empty bearer value, garbage token, wrong-secret token, wrong issuer, wrong audience and shapeless-but-valid payload all resolve correctly, with `AUTH_EXPIRED_TOKEN` confirmed against a live server running `JWT_EXPIRES_IN=2s`.
+
+**Finding — §7's stated rationale for algorithm pinning was wrong, and the real one is better.** The plan claimed that without `algorithms: ['HS256']`, `jsonwebtoken` "honours the algorithm named in the token's own header — the classic `alg` confusion attack". Measured against the installed v9:
+
+| Token | Unpinned | Pinned `['HS256']` |
+| --- | --- | --- |
+| `alg: none`, unsigned | **rejected** — `jwt signature is required` | rejected |
+| `alg: HS512`, same secret | **ACCEPTED** | rejected — `invalid algorithm` |
+
+So two corrections. First, `alg: none` is already blocked by the library, pin or no pin — the textbook attack this library was once vulnerable to has been fixed upstream, and repeating the claim would have been parroting. Second, the dangerous asymmetric→symmetric confusion (RS256 verify key replayed as an HMAC secret) **is not reachable in this configuration at all**, because the key is a symmetric string: there is no public key for an attacker to re-sign with.
+
+What pinning genuinely buys here is narrower and still worth the line: unspecified, `jsonwebtoken` derives the acceptable set from the *key type*, which for a string secret is the whole HMAC family — so the server accepts tokens it would never issue, and the moment the secret moves to an asymmetric keypair (or the library's default set changes) that latitude becomes the real attack. Pinning is defence against configuration drift, not against a live exploit in the current shape. **This is now an executable claim rather than an assertion:** `tests/requireAuth.test.ts` asserts both that the HS512 token is rejected through the API *and* that `jwt.verify` accepts the very same token when the pin is removed — so the test fails if the line ever stops doing work.
+
+**Finding — Bun's dotenv loader silently corrupts any value containing `$`.** The env schema's bcrypt-shape regex failed at boot on a hash that was demonstrably correct. Cause: Bun expands `$VAR` references in `.env`, and a bcrypt hash is `$2b$10$…` — so `$2b`, `$10` and `$KLcJJ09iXl2Hx` were each consumed as undefined variables and a 60-character hash arrived 40 characters long. Probed systematically rather than guessed at:
+
+| Form in `.env` | Result |
+| --- | --- |
+| `$2b$10$KLcJ…` | truncated |
+| `'$2b$10$KLcJ…'` (single-quoted) | truncated |
+| `"$2b$10$KLcJ…"` (double-quoted) | truncated |
+| `$$2b$$10$$KLcJ…` | empty string |
+| `\$2b\$10\$KLcJ…` | **correct** |
+
+Quoting does not disable expansion, which is a real deviation from conventional dotenv semantics — and the one form Bun honours is the one that breaks everywhere else, because Docker's `--env-file` (which Phase 7's gate uses on this very file) passes escapes through literally. **Resolution: the variable is now `DEMO_USER_PASSWORD_HASH_B64`, holding the base64-encoded hash** — the only encoding that is byte-identical through Bun's loader, through `bun --env-file`, through Docker's `--env-file`, and through an injected secret where nothing parses the value at all. `scripts/hash-password.ts` emits that form directly, so nobody has to know any of this; `src/env.ts` validates by decoding and matching the bcrypt shape, and exposes the decoded value under the separate name `DEMO_USER_PASSWORD_HASH` so no call site can confuse the two.
+
+Worth noting *why this surfaced at boot instead of in production*: the regex in the env schema was written to catch someone pasting a plaintext password, and it caught a loader bug instead. Without it, the only symptom would have been "login always rejects the correct password" — a failure with no error, no log line, and nothing pointing at the configuration. That is the concrete argument for validating the *shape* of a secret and not merely its presence.
+
+**Decision — the login endpoint spends a bcrypt compare even when the email does not match.** Short-circuiting on an unknown email makes the endpoint a timing oracle for account existence: a wrong email answers in well under a millisecond while a right one spends ~100ms in bcrypt, which is comfortably measurable across a network. The compare now runs unconditionally and the result is combined afterwards. Both failures also return the *same* code and the *same* message, asserted by a test that compares the two responses field by field — one demo user makes this close to theoretical, and it costs two lines.
+
+**Decision — four distinguishable 401s, and one deliberately indistinguishable pair.** `AUTH_MISSING_TOKEN` / `AUTH_INVALID_TOKEN` / `AUTH_EXPIRED_TOKEN` / `AUTH_INVALID_CREDENTIALS` are separated because the client acts on each differently and because "401" alone tells the logs nothing about whether a client is broken, a token is stale, or someone is probing. The pair that is *not* separated is which half of a credential pair was wrong — see above. Distinguishing causes is good; distinguishing them for an unauthenticated caller is not.
+
+**Decision — a verified signature is not a trusted payload.** `verifyAccessToken` parses the decoded claims through a zod schema after the signature checks out. A valid signature proves this service issued the token; it says nothing about the payload's shape, and a token signed with the right secret but missing `email` would otherwise reach the handler with `req.auth.email` undefined. Covered by a test that signs exactly such a token.
+
+**Decision — `expiresIn` is derived from the signed token, not from `JWT_EXPIRES_IN`.** Re-parsing the configured duration string to report a lifetime would be a second implementation of the same arithmetic, free to disagree with the `exp` claim it describes. The route decodes the token it just signed and reports `exp - iat`.
+
+**Decision — `sub` is an opaque id, not the email.** `sub` is the claim most likely to end up in a log line or as a rate-limit key (Phase 5 does exactly that), so it must not carry PII. The email travels as its own claim. Asserted by a test.
+
+**Decision — the login route is rate-limited more tightly than the query route.** Capacity 10/minute by IP, against the query route's 20. A password guess is cheap for an attacker and expensive for this process — bcrypt at cost 10 is ~100ms of CPU *by design* — so an unthrottled login is simultaneously a credential risk and a self-inflicted denial of service. Keyed by IP because there is no authenticated identity yet, which is precisely why the limiter belongs here and not only on protected routes.
+
+**Note — `.env.example` ships a real, working hash.** It is a genuine bcrypt hash of the documented demo password `demo-password`, so a reviewer can copy the file, add a Gemini key, and log in with no extra step. That is safe because the password is public: what the design demonstrates is that configuration holds a hash and login performs a bcrypt compare, and a published demo credential does not weaken either. `scripts/hash-password.ts` remains the documented way to generate your own, and it warns when the password is read from argv, since that lands in shell history.
+
+**Note — `SALT_ROUNDS` added to `turbo.json`'s `globalEnv`.** `scripts/hash-password.ts` reads it directly, because it deliberately cannot import `src/env.ts` — that schema *requires* the hash the script exists to produce, so importing it would be circular. The narrow, documented exception to validating configuration in one place.
 
 ---
 
@@ -796,7 +869,7 @@ Assumptions this plan has **not** confirmed. Items 1–4 are resolved in **Phase
 2. **Exact `finishReason` and `blockReason` enum values and their TypeScript names** — the failure mode in §8 is real, but the specific enum members must be read from the SDK's type definitions, not assumed.
 3. **The SDK's native `p-retry` behaviour** — how many attempts, on which status codes, before deciding whether any retry layer is warranted (§8).
 4. **Whether `response.text` is a property or a method** in v2.31.0 — the README shows property access; confirm against the types.
-5. **`express.json({ limit })` interaction with the prompt cap** — ensure an oversized body produces the §9 envelope rather than Express's default HTML error page.
+5. ~~**`express.json({ limit })` interaction with the prompt cap**~~ — **resolved in Phase 2.** An oversized body is rejected by body-parser as an `http-errors` instance with `type: 'entity.too.large'` before application code runs, so the prompt cap is never consulted and the default handler would answer with HTML. `errorHandler` maps all seven body-parser `type` values to `VALIDATION_FAILED`; covered by two tests.
 
 ---
 
