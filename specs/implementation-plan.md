@@ -1,7 +1,7 @@
 # AI Query Assistant — Implementation Plan
 
 **Assignment:** Husqvarna Group / GIS India — Take-Home Engineering Exercise, Senior Full Stack Engineer (Cloud & AI Applications)
-**Status:** Phases 0–7 complete on branch `feat/ai-query-assistant`. **Backend, frontend and container are all done**, each behind a gate that was run rather than reasoned about; the Phase 4 provider round-trip has been re-confirmed from inside the container (Phase 7 check 3). Phase 8 — documentation — next.
+**Status:** **All phases 0–8 complete** on branch `feat/ai-query-assistant`. Backend, frontend, container and documentation are all done, each behind a gate that was run rather than reasoned about. The real provider round-trip that closed Phase 4 gate 1 has since been re-confirmed from inside the container (Phase 7 check 3) and from a clean clone (Phase 8 check 1).
 **Budget:** ~3–4 hours, per the brief.
 
 ---
@@ -255,6 +255,8 @@ This is a concrete, provider-specific demonstration of "thoughtfully handling LL
 
 The timeout lives **in the adapter**, not the route, so the `LlmProvider` interface stays provider-agnostic. Preference order: the SDK's own `httpOptions` timeout / abort-signal support if present; otherwise an `AbortSignal.timeout()` wrapper at the adapter boundary. Default 20s, env-configurable.
 
+⚠️ **The preference order above is wrong, and the fallback is what shipped.** Phase 4 read the SDK as able to bound the whole call and took the first branch; live traffic then produced a **37,598 ms call against a 20,000 ms deadline**, because the SDK's shared `abortSignal` does not reach an attempt whose fetch is already in flight when the deadline fires. The adapter now enforces the deadline itself by racing the call against it, which is the second branch. Read as a lesson, the entry was mis-framed: an SDK's own timeout and a total deadline are not two implementations of one thing to be chosen between, so this should never have been an either/or. See the Phase 4 outcome and §17 item 1.
+
 On retry: because the SDK already bundles `p-retry`, **its built-in behaviour will be checked before any retry layer is added.** Stacking a hand-rolled backoff on top of an SDK that already retries silently multiplies worst-case latency, and it is a bug that looks like diligence.
 
 ⚠️ **Checked in Phase 4, and the concern was backwards.** Retry is *off* unless `httpOptions.retryOptions` is passed — the client returns early when it is absent — so the risk was never double-retrying but not retrying at all while assuming the SDK had it covered. See the Phase 4 outcome for the configuration chosen and why 429 is excluded from it.
@@ -272,13 +274,14 @@ Every error response, from every route, has one shape:
   "error": {
     "code": "LLM_TIMEOUT",
     "message": "The model did not respond in time. Please try again.",
-    "requestId": "01JD...",
-    "details": []
+    "requestId": "01JD..."
   }
 }
 ```
 
 `code` is a stable machine-readable value from the shared `ErrorCode` union; `message` is safe to display; `details` carries field-level validation errors only. `requestId` ties a user-visible failure to a log line.
+
+⚠️ **Corrected in Phase 8.** This example originally showed `"details": []`. As built, `errorHandler` omits the key entirely when there is no field-level detail, so a non-validation error is a three-field object and `details` is never an empty array. The README had inherited the wrong shape from here; the clean-clone gate caught it.
 
 ### Matrix
 
@@ -323,7 +326,7 @@ Correspondingly, `errorHandler` is the only place that converts an exception to 
 | `DEMO_USER_EMAIL` | demo login identity | new — **added in Phase 3**, with the hash script |
 | `DEMO_USER_PASSWORD_HASH_B64` | bcrypt hash, **base64-encoded**, never a plaintext password | new — added in Phase 3. Base64 because Bun's dotenv loader expands the `$` in `$2b$10$…`; see the Phase 3 outcome |
 | `GEMINI_API_KEY` | provider credential | **new, required** |
-| `GEMINI_MODEL` | model id | default `gemini-flash-latest` |
+| `GEMINI_MODEL` | model id | default `gemini-2.5-flash` — **corrected in Phase 8** from the `gemini-flash-latest` alias, which was measured 503-ing |
 | `LLM_TIMEOUT_MS` | adapter timeout | default 20000 |
 | `LLM_MAX_PROMPT_CHARS` | input cap | default 4000 |
 | `CORS_ORIGINS` | browser allowlist | existing, keep the comment |
@@ -1093,9 +1096,15 @@ git clone . /tmp/clean-clone && cd /tmp/clean-clone
 # Any step you have to improvise is a README bug — fix it, don't narrate it.
 
 # 2. .env.example matches the env schema exactly, with no drift in either
-#    direction. Compare the two key lists:
-grep -oE '^[A-Z_]+' apps/backend/.env.example | sort -u
-# ...against the keys in the zod object in src/env.ts. Diff must be empty.
+#    direction. NOTE: the obvious one-liner is wrong in both directions —
+#    `^[A-Z_]+` truncates DEMO_USER_PASSWORD_HASH_B64 at the digit, and
+#    grepping src/env.ts for key-like lines also catches the *derived*
+#    DEMO_USER_PASSWORD_HASH on the Env type, which is not a schema key.
+#    Allow digits, and bound the scan to the z.object({...}) literal:
+sed -n '/const EnvSchema = z.object({/,/^});/p' apps/backend/src/env.ts \
+  | grep -oE '^  [A-Z][A-Z0-9_]*:' | tr -d ' :' | sort -u > /tmp/schema-keys
+grep -oE '^[A-Z][A-Z0-9_]*' apps/backend/.env.example | sort -u > /tmp/example-keys
+diff /tmp/schema-keys /tmp/example-keys    # must be empty
 
 # 3. .env.example contains placeholders only — no real key, no real secret.
 ```
@@ -1105,6 +1114,47 @@ grep -oE '^[A-Z_]+' apps/backend/.env.example | sort -u
 6. **No Turborepo starter text survives** — `grep -n "create-turbo\|@repo/ui" README.md` finds nothing (C6).
 
 ✅ Pass when a clean clone runs by following the README alone, `.env.example` and the schema agree exactly, and checks 4–6 hold.
+
+### ✅ Phase 8 outcome — all six checks pass; the clean-clone gate earned its place
+
+**Deliverables:** root `README.md` (full rewrite, C6 closed) · `DEPLOYMENT.md` · `.env.example` final. Also rewrote the two *other* stock READMEs that C6 did not name — `apps/backend/README.md` was still the `bun init` template telling a reader to run `bun run index.ts`, and `packages/eslint-config/README.md` still called itself `@turbo/eslint-config`.
+
+| Check | Result |
+| --- | --- |
+| 1 — clean clone runs from the README alone | ✅ one documented edit, nothing improvised |
+| 2 — `.env.example` ≡ env schema | ✅ 17 keys each, zero drift either way |
+| 3 — placeholders only | ✅ both real secrets differ from the live `.env` |
+| 4 — every §12 bullet in `DEPLOYMENT.md` | ✅ 11/11, mechanically checked |
+| 5 — known-limitations section | ✅ all five named, plus four more |
+| 6 — no starter text survives | ✅ across all four doc deliverables |
+
+**Check 1 was run for real**, against a checkout materialised from the git index (`git checkout-index -a --prefix=…`), which is byte-for-byte what a reviewer receives — `.env` correctly absent, `.env.test` correctly present. Then the README followed verbatim: `bun install` (680 packages), `cp .env.example .env`, set `GEMINI_API_KEY`, and **nothing else touched**. Both apps booted, the three documented `curl` calls returned exactly the documented shapes, `bun run test` / `check-types` / `build` passed, `nvm use && bun run lint` passed under Node 24.15.0, `docker build` succeeded from the checkout, and the CORS preflight was exercised from the web origin (allowed origin → headers; `http://evil.example` → none). All seven rows of the README's fake-provider table were verified against the running container, each returning its documented code *and* status.
+
+### Findings
+
+**🔧 The documented default model was dead, and only the clean-clone gate could have found it.** Both `src/env.ts` and `.env.example` defaulted to `gemini-flash-latest`. Measured on 2026-10-26: that alias returns 503 (`LLM_UNAVAILABLE`) on every attempt, at a 60s deadline, while `gemini-2.5-flash` and `gemini-3.5-flash` both answer. A reviewer following the README on a fresh clone would have hit a 502 on their very first query — the worst possible first impression, and entirely invisible from inside a working tree whose own `.env` had already been changed to a working id during Phase 6.
+
+Fixed by defaulting both to the **pinned** `gemini-2.5-flash`. The lesson is the general one about floating aliases: `-latest` trades reproducibility for freshness, and a default that may simply stop resolving is the wrong half of that trade. The id stays env-configurable precisely so a provider outage is a config change.
+
+**Reconciling this with the Phase 6 note above**, which recorded `gemini-2.5-flash` *also* 503-ing: both readings are real, hours apart. Across three measurement rounds on 2026-10-26, `gemini-flash-latest` failed **every** time (503, 503, then 429) while the pinned ids failed only in the middle round — so the alias is not merely unlucky, and model capacity is a provider-side condition that no default can be immune to. `gemini-2.5-flash` is chosen because it resolves to *itself*, where `gemini-3.5-flash` resolves to `gemini-3.6-flash` and is therefore a floating id of the same family as the one being rejected. `.env.example` names `gemini-3.5-flash` as the known-good fallback and says to change this value first on a 502/429, which is the actionable form of the finding.
+
+**🔧 The §9 error envelope in this document was wrong, and the README had inherited it.** §9 showed `"details": []`. As built, `errorHandler` omits the key entirely when there is no field-level detail, so a non-validation error is a three-field object and `details` is *never* an empty array. Both documents corrected, and the README now shows both shapes — a `VALIDATION_FAILED` with real details and an `LLM_TIMEOUT` without. A copied-from-the-plan example is exactly the kind of inaccuracy that survives review, because it looks authoritative and nobody re-runs it.
+
+**🔧 This phase's own gate command was broken.** `grep -oE '^[A-Z_]+'` truncates `DEMO_USER_PASSWORD_HASH_B64` to `…_HASH_B` at the digit, and the natural schema-side equivalent also matches the *derived* `DEMO_USER_PASSWORD_HASH` on the `Env` type, which is not a schema key. The two artefacts therefore looked like they disagreed when they agreed exactly. The gate above is rewritten to allow digits and to bound the scan to the `z.object({…})` literal. A check whose failure mode is a false alarm gets ignored, which is the same disease as a check that cannot fail.
+
+### Decisions
+
+**`DEPLOYMENT.md` is opinionated, with the alternatives rejected at the end rather than surveyed throughout.** §12 called for this, and it is what separates reasoning from a feature tour. Four alternatives are named with the specific reason each loses: Lambda on cold starts *plus* the streaming caveat (response streaming works on a Function URL but not through REST API Gateway, so the honest next feature would force an architectural change); App Runner for abstracting away the ALB, which is where the health-check and deregistration-delay tuning lives; EC2 for having nothing to tune; EKS for a control plane serving one stateless container. Azure is given as a full component-for-component table rather than a footnote, since §12 flags the AWS/Azure pick as arbitrary.
+
+**The `secrets`-vs-`environment` distinction is given the space it deserves**, with both JSON forms side by side. The reason it is the most important line in the document is specific: task-definition revisions are **immutable and undeletable**, so a key pasted into `environment` is readable by anyone with `ecs:DescribeTaskDefinition` — a broad, read-only-*looking* permission — and rotating it later does not remove it from revision 7. The document also draws the execution-role/task-role split that follows, since collapsing them is the common shortcut that hands application code the ability to read its own secrets.
+
+**Two things were documented *because* they are weaknesses.** `lint` cannot fail the build (`eslint-plugin-only-warn` downgrades every rule), so `DEPLOYMENT.md` names it a prerequisite before the pipeline is trusted and the README lists it as a limitation. And secret rotation is a task replacement, not a live reload, because the env schema reads configuration once at boot. Both are in the brief's spirit: a limitation named reads as judgment, the same gap unmentioned reads as an oversight.
+
+**The README leads with *why a separate backend exists*,** ahead of setup. It is the one decision every other one follows from, and it is the answer to the security-awareness axis — a React app could call Gemini in ten lines, and the cost would be publishing the credential.
+
+**Graceful shutdown is documented as a drain *sequence*, not a feature.** `DEPLOYMENT.md` spells out the deregistration-delay → `SIGTERM` → `stopTimeout` ordering and states the invariant that `SHUTDOWN_TIMEOUT_MS` must stay below `stopTimeout` or the setting does nothing. A number that silently has no effect is worse than an absent one.
+
+**The honest-limitation list is longer than §13 asked for.** Beyond the five required (streaming, Redis, persistence, memory-only token, single demo user) it also names: no client-disconnect cancellation and the measurement behind it, observability being logs-only, `lint` being unable to fail, and the absence of IaC — with the reason that an unapplied Terraform module would be no more verified than prose while looking considerably more authoritative.
 
 ---
 
@@ -1134,7 +1184,9 @@ Ordering is deliberate: Phase 0 prevents the unrecoverable mistake, Phase 1 unbl
 
 Assumptions this plan has **not** confirmed. Items 1–4 are resolved in **Phase 4** and item 5 in **Phase 2**; each is checked against the installed SDK rather than trusted, and the answers are written back into this document.
 
-1. ~~**`httpOptions` timeout / `abortSignal` support**~~ — **resolved in Phase 4.** Both exist. `httpOptions.timeout` (ms) bounds each attempt; `config.abortSignal` is reused across attempts and so bounds the whole sequence. The adapter uses both; no wrapper fallback needed.
+One caveat the list earns the right to state: item 1 was resolved by *reading* the SDK's shipped source, got the answer wrong, and was only corrected once real traffic ran through it. Reading an implementation establishes what it intends; only measuring establishes what it does under timing you did not choose. The other four are statements about types and control flow that source can settle; item 1 was a claim about a race, and source cannot settle those.
+
+1. ~~**`httpOptions` timeout / `abortSignal` support**~~ — **resolved in Phase 4, then corrected after Phase 6 by live traffic.** Both exist: `httpOptions.timeout` (ms) bounds each attempt, and `config.abortSignal` is reused across attempts. Phase 4 read that reuse as bounding the whole sequence and concluded no wrapper fallback was needed. ⚠️ **That conclusion was wrong.** The shared signal only bounds the sequence when the deadline fires *between* attempts; when it fires while the next attempt's fetch is already in flight, the abort does not reach it and the call runs to roughly `attempts × timeout` — measured at **37,598 ms against `LLM_TIMEOUT_MS=20000`**, surfacing as `LLM_UNAVAILABLE` rather than `LLM_TIMEOUT`. A race, not a missing feature, and a guarantee that holds only on favourable timing is not a guarantee. The adapter now enforces the deadline itself, racing `generate()` against it in `complete()` — so the plan's original fallback instinct was right after all, for a different reason than anticipated. See the Phase 4 outcome for the instrumentation, the abandoned-promise handler that keeps a late rejection from crashing the process, and why the per-attempt timeout is deliberately not sliced.
 2. ~~**Exact `finishReason` and `blockReason` enum values and their TypeScript names**~~ — **resolved in Phase 4.** The type is `BlockedReason`, not `BlockReason`. 19 `FinishReason` members and 8 `BlockedReason` members, both listed in the Phase 4 outcome.
 3. ~~**The SDK's native `p-retry` behaviour**~~ — **resolved in Phase 4.** Retry is OFF unless `retryOptions` is passed. Opted in with 2 attempts / 0.5s initial delay, 429 excluded.
 4. ~~**Whether `response.text` is a property or a method**~~ — **resolved in Phase 4.** A getter: `get text(): string | undefined`. The `| undefined` is the failure mode §8 is built around.

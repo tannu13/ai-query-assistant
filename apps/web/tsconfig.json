@@ -5,7 +5,11 @@
     "module": "Preserve",
     "moduleDetection": "force",
     "jsx": "react-jsx",
-    "types": ["vite/client"],
+
+    // `bun` alongside `vite/client` because `tests/` is type-checked too (see
+    // `include`), and the tests import `bun:test`. Without it the test files
+    // would be read but fail to resolve their own test runner.
+    "types": ["vite/client", "bun"],
 
     // Matches the backend and @repo/shared, so the shared package's
     // TypeScript source resolves identically under Vite and under Bun.
@@ -22,6 +26,17 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "vite.config.ts"],
+  // `tests/**` is included deliberately, matching the backend. Left out, the
+  // XSS regression guard in `tests/rendering.test.tsx` still *runs* under
+  // `bun test` but its own types are never checked — so a type error there is
+  // invisible to `check-types`, which is the one file where that matters least
+  // acceptably: it is what catches a `dangerouslySetInnerHTML` added later.
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "tests/**/*.ts",
+    "tests/**/*.tsx",
+    "vite.config.ts"
+  ],
   "exclude": ["node_modules", "dist"]
 }

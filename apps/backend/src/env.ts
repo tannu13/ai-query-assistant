@@ -91,7 +91,17 @@ const EnvSchema = z.object({
   GEMINI_API_KEY: z
     .string()
     .min(10, 'GEMINI_API_KEY is too short to be a real key'),
-  GEMINI_MODEL: z.string().min(1).default('gemini-flash-latest'),
+  /**
+   * Model id. A **pinned** id by default, not the `gemini-flash-latest`
+   * alias, which was measured 503-ing on 2026-10-26 — the Phase 8 clean-clone
+   * gate hit `LLM_UNAVAILABLE` on its first query because this default
+   * pointed at it. A floating alias trades reproducibility for freshness, and
+   * a default that may stop resolving is the wrong half of that trade.
+   *
+   * Overridable precisely so a provider-side outage is a config change rather
+   * than a code change.
+   */
+  GEMINI_MODEL: z.string().min(1).default('gemini-2.5-flash'),
 
   /**
    * Which implementation of the LlmProvider seam to use.
