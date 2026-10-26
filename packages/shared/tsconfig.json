@@ -1,0 +1,19 @@
+{
+  "extends": "@repo/typescript-config/base.json",
+  "compilerOptions": {
+    // This package ships TypeScript source rather than a build output (a
+    // Turborepo "just-in-time" package), so consumers compile it themselves.
+    // Bundler resolution matches both consumers: Bun on the backend, Vite on
+    // the web app. The NodeNext default in the base config would require
+    // explicit `.js` extensions on relative imports, which neither needs.
+    "module": "Preserve",
+    "moduleResolution": "bundler",
+    "verbatimModuleSyntax": true,
+    "declaration": false,
+    "declarationMap": false,
+    "noEmit": true,
+    "lib": ["ES2022"]
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules"]
+}
